@@ -1,0 +1,627 @@
+/*
+AI Chat Backup v3.6.5 for Gemini and ChatGPT.
+Paste this script into the browser developer console on a signed-in Gemini or ChatGPT page and confirm your account label.
+Scan History first, then read the discovered conversations. Allow pop-ups and multiple downloads for the site if prompted.
+Progress from v3.5 and earlier stays in its original database. This version does not preload a Takeout skip list.
+Use the same browser and account label to resume v3.6 progress. Use Mark All for Re-reading to read saved conversations again.
+Automatic Markdown downloads contain the first successful read, subsequent batches of 20, and any final remainder.
+JSON preserves structured records. IndexedDB stores resume progress locally.
+The script can only capture history exposed by the website. Verify your exports for completeness.
+*/
+(async () => {
+  'use strict';
+  /*
+   * Version, panel ID, and database name.
+   * Keep the v3.6 database so existing progress can be resumed.
+   */
+  const VERSION='3.6.5', PANEL='ai-chat-backup-universal', DB='ai-chat-backup-fresh-v36';
+  /*
+   * Time values are in milliseconds. 6000 is 6 seconds and 90000 is 90 seconds.
+   * A stable scroll edge is a stopping condition for this read pass. Completeness remains unverified.
+   */
+  const WAIT_STABLE=6000, POLL=500, PAGE_TIMEOUT=90000, CAPTURE_TIMEOUT=360000;
+  const host=location.hostname, ORIGIN=location.origin;
+  const platform=host==='gemini.google.com'?'gemini':(['chatgpt.com','chat.openai.com'].includes(host)?'chatgpt':null);
+  if(!platform)throw new Error('Run this script on a signed-in Gemini or ChatGPT page.');
+  const NAME=platform==='gemini'?'Gemini':'ChatGPT';
+  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  /*
+   * Stop the previous panel before starting another task against the same progress.
+   */
+  const taskRunning=p=>[...p.querySelectorAll('button')].some(b=>b.disabled&&!/^(?:下载|随时下载|Download)/.test(b.textContent.trim()));
+  const oldPanel=document.getElementById(PANEL);
+  if(oldPanel){
+    [...oldPanel.querySelectorAll('button')].find(b=>['Stop','停止'].includes(b.textContent))?.click();
+    for(let i=0;i<160&&taskRunning(oldPanel);i++)await sleep(250);
+    if(taskRunning(oldPanel))throw new Error('The previous task is still saving. Wait for its controls to become available before running the script again.');
+    oldPanel.remove();
+  }
+  if(platform==='gemini')for(const old of document.querySelectorAll('#gemini-backup-v5,#gemini-backup-v4,#gemini-local-backup-panel')){
+    [...old.querySelectorAll('button')].find(b=>b.textContent==='停止')?.click();
+    for(let i=0;i<160&&old.querySelector('button:disabled');i++)await sleep(250);
+    if(old.querySelector('button:disabled'))throw new Error('An older Gemini task is still saving. Try again shortly.');
+    old.remove();clearInterval(window.__geminiBackupAutoResume);
+  }
+  /*
+   * Account detection only reads labels already displayed on the page.
+   */
+  function email(doc){
+    if(platform!=='gemini')return null;
+    for(const el of doc.querySelectorAll('[aria-label]')){
+      const label=el.getAttribute('aria-label')||'';
+      if(!/Google Account|Google 帐号|Google 账号|Google账户/i.test(label))continue;
+      const match=label.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+      if(match)return match[0].toLowerCase();
+    }return null;
+  }
+  const observed=email(document);
+  /*
+   * Account labels isolate progress. Reuse the label when resuming and change it when switching accounts.
+   */
+  const profile=prompt('Enter a stable label for this '+NAME+' account or workspace (your email is recommended).\nUse the same label to resume. Use a different label for a different account or workspace.',observed||localStorage.getItem('ai-chat-backup-profile-'+platform)||'')?.trim();
+  if(!profile)return;
+  if(observed&&profile.includes('@')&&profile.toLowerCase()!==observed)throw new Error('The email does not match the current Gemini account.');
+  localStorage.setItem('ai-chat-backup-profile-'+platform,profile);
+  const scope=platform+'\n'+profile;
+  class Fatal extends Error{}
+  let stopped=false,busy=false,reader=null,phase='Ready',notice='',discovery='History has not been scanned. Completeness is unverified.',skipScan=false;
+  const found=new Map(),records=new Map(),imports=new Map(),failures=new Map();
+  /*
+   * Normalize supported conversation URLs by removing query strings and fragments.
+   * Conversation URLs do not establish creation dates.
+   */
+  function urlOf(input,p=platform){
+    try{const u=new URL(input,ORIGIN);u.search='';u.hash='';
+      if(p==='gemini'&&u.hostname==='gemini.google.com'&&/^\/(?:u\/\d+\/)?app\/[\w-]+\/?$/.test(u.pathname))return u.href.replace(/\/$/,'');
+      if(p==='chatgpt'&&['chatgpt.com','chat.openai.com'].includes(u.hostname)&&/^\/(?:g\/[^/]+\/)?c\/[\w-]+\/?$/.test(u.pathname))return u.href.replace(/\/$/,'');
+    }catch{}return null;
+  }
+  const hasText=m=>!!m&&(typeof m.text==='string'&&!!m.text.trim()||typeof m.markdown==='string'&&!!m.markdown.trim());
+  const validRecord=r=>Array.isArray(r?.messages)&&r.messages.some(hasText);
+  const textSize=r=>(r?.messages||[]).reduce((sum,m)=>sum+Math.max(m.text?.length||0,m.markdown?.length||0),0);
+  /*
+   * Stop if the page origin or detected account changes.
+   */
+  function guard(doc=document){
+    if(new URL(doc.URL).origin!==ORIGIN)throw new Fatal('The page left the original site. Check your sign-in status.');
+    const current=email(doc);if(observed&&current&&current!==observed)throw new Fatal('The account changed. The task has stopped.');
+  }
+  /*
+   * IndexedDB stores local resume progress.
+   * The state store holds progress, records holds captured messages, and imports holds imported records. Clearing site data can remove local progress.
+   */
+  const db=await new Promise((resolve,reject)=>{const request=indexedDB.open(DB,1);
+    request.onupgradeneeded=()=>{for(const name of ['state','records','imports'])if(!request.result.objectStoreNames.contains(name))request.result.createObjectStore(name);};
+    request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(new Error('Could not open local progress: '+request.error));
+    request.onblocked=()=>reject(new Error('The local database is blocked by another tab. Close older backup tabs and retry.'));
+  });
+  const get=(store,key)=>new Promise((resolve,reject)=>{const r=db.transaction(store).objectStore(store).get(key);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});
+  const state=await get('state',scope);
+  // Extract IDs from discovered links. No conversation IDs or skip list are bundled.
+  const chatId=url=>{try{return new URL(url,ORIGIN).pathname.match(/\/(?:app|c)\/([\w-]+)\/?$/)?.[1]||null;}catch{return null;}};
+  for(const item of state?.discovered||[]){const url=urlOf(item.url);if(url&&new URL(url).origin===ORIGIN)found.set(url,{url,title:String(item.title||'Untitled conversation')});}
+  for(const url of state?.savedUrls||[]){const row=await get('records',scope+'\n'+url);if(validRecord(row))records.set(url,row);}
+  for(const key of state?.importKeys||[]){const row=await get('imports',scope+'\n'+key);if(validRecord(row))imports.set(key,row);}
+  for(const f of state?.failures||[])failures.set(f.url,f);
+  discovery=state?.discovery||discovery;
+  /*
+   * Store conversation content and progress in one transaction and wait for it to commit.
+   * If the transaction fails, pause and keep the page open to export captured content.
+   */
+  function persist(item,imported){return new Promise((resolve,reject)=>{
+    const tx=db.transaction(['state','records','imports'],'readwrite');
+    if(item)tx.objectStore('records').put(item,scope+'\n'+item.url);
+    if(imported)tx.objectStore('imports').put(imported,scope+'\n'+imported.key);
+    tx.objectStore('state').put({discovered:[...found.values()],savedUrls:[...new Set([...records.keys(),...(item?[item.url]:[])])],importKeys:[...new Set([...imports.keys(),...(imported?[imported.key]:[])])],failures:[...failures.values()],discovery,updatedAt:new Date().toISOString()},scope);
+    tx.oncomplete=resolve;tx.onerror=()=>reject(new Fatal('Could not save locally: '+tx.error));tx.onabort=()=>reject(new Fatal('Local saving was interrupted. Keep the page open and download the captured messages.'));
+  });}
+  /*
+   * Use textContent so conversation titles and status messages render as text.
+   */
+  const panel=document.createElement('aside');panel.id=PANEL;
+  panel.style.cssText='position:fixed;right:16px;top:16px;width:380px;max-width:calc(100vw - 64px);max-height:86vh;overflow:auto;z-index:2147483647;padding:20px;background:#fff;color:#292d35;border:1px solid #dfe2e8;border-radius:16px;box-shadow:0 12px 40px #17203320;font:13px/1.6 system-ui;box-sizing:content-box;color-scheme:light';
+  const style=document.createElement('style');style.textContent=`
+    #${PANEL} button{font:inherit;line-height:1.4;box-sizing:border-box;padding:9px 12px;margin:4px 3px;border:1px solid #dfe2e8;border-radius:9px;background:#fff;color:#414854;cursor:pointer;transition:background .15s}
+    #${PANEL} button:hover:not(:disabled){background:#f1f3f7;border-color:#bcc3ce}
+    #${PANEL} button:focus-visible{outline:2px solid #9aa8bd;outline-offset:2px}
+    #${PANEL} button:disabled{background:#f5f6f8;color:#a6acb6;border-color:#eaecf0;cursor:default}
+    #${PANEL} button.primary{width:calc(100% - 6px);background:#303b4d;color:#fff;border-color:#303b4d;font-weight:550;padding:11px 14px;font-size:14px}
+    #${PANEL} button.primary:hover:not(:disabled){background:#414e63}
+    #${PANEL} button.primary:disabled{background:#e6e9ee;border-color:#e6e9ee;color:#99a0ac}
+    #${PANEL} details{margin:14px 0;padding:10px 12px;border:1px solid #e7e9ee;border-radius:10px}
+    #${PANEL} summary{cursor:pointer;color:#5c6573}#${PANEL} strong{font-size:16px;font-weight:600}
+  `;panel.append(style);
+  const add=(tag,text)=>{const n=document.createElement(tag);if(text)n.textContent=text;panel.append(n);return n;};
+  add('strong','AI Chat Backup v'+VERSION+' · '+NAME);
+  const identity=add('p','Account label: '+profile);identity.style.cssText='color:#89909d;font-size:12px;margin:4px 0 14px;overflow-wrap:anywhere';
+  const status=add('p'),counts=add('p');
+  counts.style.cssText='background:#f5f6f9;border-radius:10px;padding:12px;color:#4e5868';
+  const scanProgress=add('p');scanProgress.style.cssText='color:#64748b;font-size:12px;white-space:pre-line';scanProgress.hidden=true;
+  const hints=add('p');hints.style.cssText='font-size:12px;color:#64748b';hints.hidden=true;
+  function showHint(message){hints.textContent=message;hints.hidden=false;}
+  const details=add('details');details.open=false;
+  const summary=document.createElement('summary');summary.textContent='Latest saved conversation: first and last messages';
+  const preview=document.createElement('pre');preview.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;font-size:12px';
+  preview.textContent='No messages saved yet. Try reading and downloading one conversation to preview its messages here.';details.append(summary,preview);
+  const controls=[],downloadButtons=[];let skipScanButton=null;
+  /*
+   * Deduplicate exports by platform, account label, and conversation URL.
+   * Choose the longest version for display. JSON retains earlier passes in previousPasses.
+   */
+  function allRows(){const map=new Map();
+    for(const r of [...imports.values(),...[...records.values()].map(r=>({...r,platform,accountLabel:profile}))]){
+      if(!validRecord(r))continue;const key=r.platform+'\n'+r.accountLabel+'\n'+r.url,old=map.get(key);
+      if(!old||textSize(r)>textSize(old)||(textSize(r)===textSize(old)&&String(r.capturedAt)>String(old.capturedAt)))map.set(key,r);
+    }return [...map.values()];
+  }
+  function update(message){if(message!==undefined)notice=message;
+    status.textContent='Status: '+phase+'. '+notice;
+    const done=[...records.values()].filter(r=>r.loadFinished).length;
+    const rows=allRows(),messages=rows.reduce((n,r)=>n+r.messages.filter(hasText).length,0);
+    counts.textContent='Local v3.6 progress\nDiscovered links: '+found.size+'. Saved conversations: '+records.size+' (read ended: '+done+', partial: '+(records.size-done)+'). Failed: '+failures.size+'. Imported: '+imports.size+'.\nAvailable to export: '+rows.length+' conversations / '+messages+' messages.';
+    counts.style.whiteSpace='pre-line';downloadButtons.forEach(b=>b.disabled=!rows.length);
+    if(skipScanButton)skipScanButton.hidden=!phase.startsWith('Scan');
+  }
+  function showPreview(r){preview.textContent=(r.title||'Untitled')+'\n'+r.messages.length+' messages. '+(r.loadFinished?'Read ended. Verify completeness.':'Partial capture. Resume reading to continue.')+'\nFirst: '+(r.messages[0]?.text||r.messages[0]?.markdown||'').slice(0,450)+'\nLast: '+(r.messages.at(-1)?.text||r.messages.at(-1)?.markdown||'').slice(-450);}
+  /*
+   * Prevent duplicate starts and disable primary controls while a task runs.
+   * Restore controls in finally after success or failure.
+   */
+  async function action(name,fn){if(busy)return;busy=true;stopped=false;skipScan=false;phase=name;controls.forEach(b=>b.disabled=true);update('');
+    try{await fn();phase=stopped?'Stopped':'Ready';}
+    catch(error){stopped=true;phase='Paused';notice=error.message;console.error('[AI Chat Backup v3]',error);}
+    finally{busy=false;controls.forEach(b=>b.disabled=false);update();}
+  }
+  /*
+   * Open the reader during the button click to reduce pop-up blocking.
+   */
+  function button(label,fn,{always=false,popup=false,download=false}={}){
+    const b=add('button',label);
+    if(!always)controls.push(b);if(download)downloadButtons.push(b);
+    b.onclick=()=>{if(!always&&busy)return;
+      if(popup){
+        const initialUrl=readerStartUrl();
+        try{reader=window.open(initialUrl,'ai_backup_reader_v33_'+platform,'width=1080,height=850');}
+        catch(error){update('Could not open the reader window: '+error.message);return;}
+        if(!reader||reader.closed){update('The reader window was blocked. Allow pop-ups for this site and try again.');return;}
+        showHint('Opening a conversation in the reader window. '+(label.includes('Rescan')?'The main page scans history first, then this window reads conversations.':'This window reads the queued conversations in order.'));
+      }
+      if(always){Promise.resolve().then(fn).catch(error=>update(error.message));}
+      else void action(label,fn);
+    };return b;
+  }
+  /*
+   * Open the reader at a real conversation URL instead of about:blank.
+   * Pop-up rules, expired sessions, or browser isolation can still block the reader.
+   */
+  function readerStartUrl(){
+    const candidates=[...found.values()].map(item=>urlOf(item.url)).filter(url=>url&&new URL(url).origin===ORIGIN);
+    return candidates.find(url=>!records.get(url)?.loadFinished)||urlOf(location.href)||candidates[0]||(ORIGIN+(platform==='gemini'?'/app':'/'));
+  }
+  /*
+   * The short hash fingerprints messages locally and can collide.
+   */
+  function hash(text){let n=2166136261;for(let i=0;i<text.length;i++)n=Math.imul(n^text.charCodeAt(i),16777619);return (n>>>0).toString(16)+'-'+text.length;}
+  /*
+   * Recursively convert DOM nodes to Markdown.
+   * Complex formatting can lose fidelity. Exports do not include original image or attachment files.
+   */
+  function markdown(root){
+    function walk(node){if(node.nodeType===3)return node.textContent;if(node.nodeType!==1)return '';
+      if(node.matches('script,style,button,svg,.sr-only,.cdk-visually-hidden,.katex-html'))return '';
+      if(node.matches('.katex')){const tex=node.querySelector('annotation[encoding="application/x-tex"]');return tex?' $'+tex.textContent+'$ ':node.textContent;}
+      const tag=node.tagName.toLowerCase(),body=()=>[...node.childNodes].map(walk).join('');
+      if(tag==='br')return '\n';
+      if(tag==='pre'){const text=(node.querySelector('code')||node).textContent,ticks='`'.repeat(Math.max(3,...(text.match(/`+/g)||[]).map(s=>s.length+1)));return '\n\n'+ticks+'\n'+text+'\n'+ticks+'\n\n';}
+      if(tag==='code'){const ticks='`'.repeat(Math.max(1,...(node.textContent.match(/`+/g)||[]).map(s=>s.length+1)));return ticks+' '+node.textContent+' '+ticks;}
+      if(/^h[1-6]$/.test(tag))return '\n\n'+'#'.repeat(+tag[1])+' '+body()+'\n\n';
+      if(tag==='a')return '['+body()+']('+(node.getAttribute('href')||'')+')';
+      if(tag==='img')return '\n[Image: '+(node.alt||'original file unavailable')+']\n';
+      if(['strong','b'].includes(tag))return '**'+body()+'**';
+      if(['em','i'].includes(tag))return '*'+body()+'*';
+      if(tag==='li')return '\n- '+body().trim()+'\n';
+      if(tag==='table'){
+        const rows=[...node.querySelectorAll('tr')].map(tr=>[...tr.children].map(c=>walk(c).trim().replace(/\|/g,'\\|').replace(/\n/g,' ')));
+        if(!rows.length)return '';const width=Math.max(...rows.map(r=>r.length)),row=r=>'| '+Array.from({length:width},(_,i)=>r[i]||'').join(' | ')+' |';
+        return '\n\n'+row(rows[0])+'\n'+row(Array(width).fill('---'))+'\n'+rows.slice(1).map(row).join('\n')+'\n\n';
+      }
+      return ['p','div','section','ul','ol','blockquote'].includes(tag)?'\n\n'+body()+'\n\n':body();
+    }return walk(root).replace(/\n[ \t]+/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+  }
+  /*
+   * Capture the questions and answers currently in the DOM in page order.
+   * Clone nodes before removing controls and accessibility text to preserve the live page.
+   * Prefer stable message IDs. Fall back to role, text hash, and occurrence count.
+   */
+  function snapshot(doc){
+    let nodes;
+    if(platform==='gemini'){
+      const users=[...doc.querySelectorAll('.query-text')];
+      if(!users.length)users.push(...doc.querySelectorAll('user-query .query-text-line,user-query .user-query-container'));
+      let answers=[...doc.querySelectorAll('message-content .markdown-main-panel')];
+      if(!answers.length)answers=[...doc.querySelectorAll('model-response message-content')];
+      if(!answers.length)answers=[...doc.querySelectorAll('model-response .response-container-content,model-response .markdown-main-panel')];
+      nodes=[...users.map(n=>({node:n,role:'user'})),...answers.map(n=>({node:n,role:'assistant'}))];
+    }else{
+      nodes=[...doc.querySelectorAll('[data-message-author-role="user"],[data-message-author-role="assistant"]')].map(node=>({node,role:node.getAttribute('data-message-author-role')}));
+      if(!nodes.length)nodes=[...doc.querySelectorAll('article[data-turn="user"],article[data-turn="assistant"]')].map(node=>({node,role:node.getAttribute('data-turn')}));
+    }
+    nodes=nodes.filter(({node},i,all)=>!node.closest('#'+PANEL)&&!all.some((x,j)=>j!==i&&x.node!==node&&x.node.contains(node)));
+    nodes.sort((a,b)=>a.node===b.node?0:(a.node.compareDocumentPosition(b.node)&4?-1:1));
+    const seen=new Map();
+    return nodes.map(({node,role})=>{
+      const copy=node.cloneNode(true);copy.querySelectorAll('script,style,button,svg,.sr-only,.cdk-visually-hidden').forEach(n=>n.remove());
+      const text=copy.textContent.trim(),md=markdown(copy);
+      const owner=platform==='gemini'?(role==='user'?(node.closest('[id^="user-query-content-"]')||node.closest('user-query')||node):(node.closest('message-content')||node.closest('model-response')||node)):(node.closest('[data-message-id]')||node);
+      const id=node.getAttribute('data-message-id')||owner.getAttribute('data-message-id')||owner.id||node.id;
+      const fingerprint=role+':'+hash(text),occurrence=seen.get(fingerprint)||0;seen.set(fingerprint,occurrence+1);
+      return {key:role+':'+(id||fingerprint+':'+occurrence),role,text,markdown:md};
+    }).filter(hasText);
+  }
+  /*
+   * Collect conversation links currently loaded in the page.
+   */
+  function remember(){
+    for(const a of document.querySelectorAll('a[href]')){if(a.closest('#'+PANEL))continue;const url=urlOf(a.href);
+      if(url&&new URL(url).origin===ORIGIN)found.set(url,{url,title:a.textContent.trim()||found.get(url)?.title||'Untitled conversation'});
+    }
+    const url=urlOf(location.href);if(url&&!found.has(url))found.set(url,{url,title:document.title});
+  }
+  /*
+   * Find visible sidebar elements while accounting for clipping by ancestor containers.
+   */
+  // Some Angular hosts in Gemini's mobile layout have zero height even when their children are visible.
+  // Clip only against ancestors with nonzero dimensions and continue checking visibility and scroll containers.
+  function onScreen(element){
+    if(!element?.getClientRects().length)return false;
+    const r=element.getBoundingClientRect();let left=Math.max(0,r.left),right=Math.min(window.innerWidth,r.right),top=Math.max(0,r.top),bottom=Math.min(window.innerHeight,r.bottom);
+    for(let n=element;n&&n!==document.body;n=n.parentElement){
+      const css=getComputedStyle(n);if(n.hidden||n.getAttribute('aria-hidden')==='true'||css.display==='none'||css.visibility==='hidden')return false;
+      if(n!==element){const b=n.getBoundingClientRect();if(b.width>1&&/hidden|clip|auto|scroll/.test(css.overflowX)){left=Math.max(left,b.left);right=Math.min(right,b.right);}if(b.height>1&&/hidden|clip|auto|scroll/.test(css.overflowY)){top=Math.max(top,b.top);bottom=Math.min(bottom,b.bottom);}}
+    }
+    return right-left>1&&bottom-top>1;
+  }
+  function historyRoots(){
+    const roots=[...document.querySelectorAll(platform==='gemini'?'conversations-list,#history,nav,aside,[role="navigation"]':'#history,nav,aside,[role="navigation"]')].filter(n=>!n.closest('#'+PANEL));
+    // A custom-element host can have no box while its child links are visible.
+    const visibleLinks=[...document.querySelectorAll('a[href]')].filter(a=>!a.closest('#'+PANEL)&&urlOf(a.href)&&new URL(a.href).origin===ORIGIN&&onScreen(a));
+    return [...new Set([...roots.filter(n=>onScreen(n)||visibleLinks.some(a=>n.contains(a))),...visibleLinks])];
+  }
+  /*
+   * Find the history scroller among link ancestors and candidate containers.
+   * A stalled scroll can indicate an incorrect container. It does not establish completeness.
+   */
+  function historyScroll(){
+    const roots=historyRoots(),candidates=[],seen=new Set();
+    const add=n=>{if(n&&!seen.has(n)){seen.add(n);candidates.push(n);}};
+    // Inspect both directions: scrolling descendants and link ancestors.
+    for(const root of roots){
+      for(let n=root;n&&n!==document.body;n=n.parentElement)add(n);
+      for(const n of root.querySelectorAll('*'))if(n.clientHeight>=30&&n.scrollHeight>n.clientHeight+5)add(n);
+    }
+    const usable=candidates.filter(n=>onScreen(n)&&n.clientHeight>=30&&(/auto|scroll/.test(getComputedStyle(n).overflowY)||n.scrollTop>0));
+    const withLinks=usable.filter(n=>[...n.querySelectorAll('a[href]')].some(a=>urlOf(a.href)&&onScreen(a)));
+    return withLinks.find(n=>n.scrollHeight>n.clientHeight+5)||withLinks[0]||usable.find(n=>n.scrollHeight>n.clientHeight+5)||usable[0]||null;
+  }
+  /*
+   * Record visible links, the last item, scroll position, height, and loading state for comparison.
+   */
+  function historyFrame(sc){
+    const bounds=sc.getBoundingClientRect(),rows=[],visible=[];
+    for(const a of sc.querySelectorAll('a[href]')){const url=urlOf(a.href);if(!url||new URL(url).origin!==ORIGIN)continue;
+      const item={url,title:a.textContent.trim()||found.get(url)?.title||'Untitled conversation'};rows.push(item);
+      const r=a.getBoundingClientRect();if(r.height>0&&r.bottom>bounds.top&&r.top<bounds.bottom)visible.push(item);
+    }
+    const shown=visible.length?visible:rows.slice(-10);
+    return {rows,visibleCount:visible.length,signature:shown.map(r=>r.url).join('|'),tail:shown.at(-1)?.title||'No conversation links visible',top:sc.scrollTop,height:sc.scrollHeight,viewport:sc.clientHeight,
+      bottom:sc.scrollTop+sc.clientHeight>=sc.scrollHeight-8,
+      loading:!!sc.querySelector('[role="progressbar"],[aria-busy="true"]')||!!document.querySelector('[aria-label="Loading conversation history"],[aria-label="Loading Gems and Recent conversations"]')};
+  }
+  /*
+   * Wait for history to become visible and try expanding the sidebar if necessary.
+   * Report detection failure when the list cannot be found.
+   */
+  async function ensureHistoryReady(){
+    const ready=()=>{const sc=historyScroll();return sc&&historyFrame(sc).visibleCount>0?sc:null;};
+    let sc=ready();if(sc)return sc;
+    if(!historyRoots().length){
+      const menu=[...document.querySelectorAll('button')].find(b=>!b.closest('#'+PANEL)&&onScreen(b)&&b.getAttribute('aria-expanded')!=='true'&&/^(Main menu|Open menu|Expand menu|Open sidebar|主菜单|打开菜单|展开菜单|打开侧边栏)$/i.test((b.getAttribute('aria-label')||'').trim()));
+      if(menu){menu.click();update('Tried to expand the sidebar. Waiting for history links.');}
+    }
+    const deadline=Date.now()+30000;
+    while(!stopped&&!skipScan&&Date.now()<deadline){
+      guard();sc=ready();if(sc)return sc;
+      const candidate=historyScroll(),links=[...document.querySelectorAll('a[href]')].filter(a=>!a.closest('#'+PANEL)&&urlOf(a.href)&&onScreen(a));
+      const detail='Sidebar detection: '+links.length+' visible conversation links. Scroll area: '+(candidate?'found':'missing')+'. Time remaining: '+Math.max(0,Math.ceil((deadline-Date.now())/1000))+' seconds.';
+      scanProgress.textContent=detail;
+      update(detail+' If the sidebar is open and the count stays at zero, the current page layout may be unsupported.');await sleep(500);
+    }
+    if(stopped||skipScan)return null;
+    throw new Error('The sidebar is hidden or its conversation links or scroll area could not be detected. If titles are visible, keep the detection counts above for troubleshooting. Saved messages are retained.');
+  }
+  /*
+   * Find the conversation scroller using Gemini's container first, then message ancestors.
+   */
+  function conversationScroll(doc){
+    if(platform==='gemini'){const n=doc.querySelector('infinite-scroller.chat-history');if(n)return n;}
+    const first=doc.querySelector(platform==='gemini'?'user-query,model-response,.query-text':'[data-message-author-role],article[data-turn]');
+    for(let n=first?.parentElement;n&&n!==doc.body;n=n.parentElement){const s=doc.defaultView.getComputedStyle(n);if(/auto|scroll/.test(s.overflowY)&&n.scrollHeight>n.clientHeight+5)return n;}
+    return doc.scrollingElement;
+  }
+  function isLoading(doc,scroll){return !!scroll?.querySelector('[role="progressbar"],[aria-busy="true"]')||!!doc.querySelector('[data-testid="stop-button"],[aria-label="Loading conversation"],model-response[aria-busy="true"]');}
+  function move(scroll,top){scroll.scrollTop=top;scroll.dispatchEvent(new scroll.ownerDocument.defaultView.Event('scroll',{bubbles:true}));}
+  /*
+   * Collect history links while scrolling and save progress periodically.
+   * At the current bottom, retry loading older entries until the user stops the scan.
+   * The scan relies on the visible page and can encounter site-side loading limits.
+   */
+  async function scan(){
+    guard();
+    const initialCount=found.size;
+    const seenThisScan=new Set();
+    let lastNew=Date.now(),lastSave=0,nextProbe=0,probeDelay=5000;
+    scanProgress.hidden=false;
+    try{
+      while(!stopped){
+        guard();
+        const sc=historyScroll();
+        const frame=sc?historyFrame(sc):null;
+        if(!frame?.rows.length){
+          discovery='Waiting for the sidebar. The scan is still running. Expand the Gemini history list.';
+          scanProgress.textContent=discovery;
+          update(discovery);
+          await sleep(1500);
+          continue;
+        }
+        const countBefore=seenThisScan.size;
+        for(const item of frame.rows){
+          seenThisScan.add(item.url);
+          found.set(item.url,item);
+        }
+        if(seenThisScan.size>countBefore){
+          lastNew=Date.now();
+          probeDelay=5000;
+          nextProbe=Date.now()+probeDelay;
+        }
+        const idle=Math.floor((Date.now()-lastNew)/1000);
+        const position=frame.bottom?'At the bottom of the current list. Waiting and retrying.':'Scrolling to older conversations.';
+        discovery=position+' History completeness is unverified.';
+        scanProgress.textContent='Seen this scan: '+seenThisScan.size+' links · New: '+(found.size-initialCount)+'\n'+position+(frame.loading?' · Gemini reports loading':'')+'\nNo new links for '+idle+' seconds. Click Stop to end the scan.';
+        update(discovery);
+        if(Date.now()-lastSave>=5000){await persist();lastSave=Date.now();}
+        if(!frame.bottom){
+          // All loaded links have been collected. Jump to the bottom of Gemini's accumulated list and scan other containers screen by screen.
+          const accumulated=platform==='gemini'&&sc.matches('infinite-scroller')&&sc.querySelector('conversations-list')&&frame.rows.length>Math.max(20,frame.visibleCount*2);
+          move(sc,accumulated?sc.scrollHeight:Math.min(sc.scrollHeight,sc.scrollTop+Math.max(40,sc.clientHeight*0.8)));
+        }else if(Date.now()>=nextProbe){
+          // Move away from the bottom and back to trigger lazy loading. Back off between retries.
+          move(sc,Math.max(0,sc.scrollTop-Math.max(80,sc.clientHeight*0.65)));
+          await sleep(350);
+          if(stopped)break;
+          if(sc.isConnected)move(sc,sc.scrollHeight);
+          probeDelay=Math.min(30000,probeDelay+5000);
+          nextProbe=Date.now()+probeDelay;
+        }
+        await sleep(900);
+      }
+    }finally{
+      discovery=stopped?'Scan stopped. Resume scanning or read the discovered links.':'The scan was interrupted. Previously saved progress is retained.';
+      await persist();
+      scanProgress.textContent+='\n'+discovery;
+    }
+    update(discovery);
+  }
+  /*
+   * Merge snapshots from one scroll pass using shared messages as anchors.
+   * With no overlap, prepend or append based on scroll direction. Virtualized lists and edits can affect ordering.
+   */
+  function merge(order,map,current,direction='append'){
+    // Virtualized pages can replace every visible node between scrolls, leaving no shared anchor.
+    if(order.length&&current.length&&!current.some(row=>map.has(row.key))){
+      const keys=current.map(row=>row.key);if(direction==='prepend')order.unshift(...keys);else order.push(...keys);
+      for(const row of current)map.set(row.key,row);return;
+    }
+    let next=null;
+    for(let i=current.length-1;i>=0;i--){const row=current[i];if(!map.has(row.key)){const at=next===null?-1:order.indexOf(next);if(at<0)order.push(row.key);else order.splice(at,0,row.key);}map.set(row.key,row);next=row.key;}
+  }
+  /*
+   * Keep differing earlier reads in previousPasses.
+   * Preserve separate passes in JSON and deduplicate by comparing full message arrays.
+   */
+  function preservePasses(row,prior){
+    const passes=[...(prior?.previousPasses||[])];
+    if(validRecord(prior))passes.push({capturedAt:prior.capturedAt,messages:prior.messages,stopReason:prior.stopReason});
+    const currentSignature=JSON.stringify(row.messages),seen=new Set([currentSignature]);
+    return {...row,previousPasses:passes.filter(p=>{const sig=JSON.stringify(p.messages);if(seen.has(sig))return false;seen.add(sig);return true;}),completeness:'unverified'};
+  }
+  /*
+   * Persist before updating memory and the panel so a failed write cannot appear successful.
+   */
+  async function save(row,prior){if(!validRecord(row))return null;
+    const selected=preservePasses(row,prior);
+    await persist(selected);records.set(row.url,selected);showPreview(selected);update();return selected;
+  }
+  /*
+   * Scroll up to find the start, then down to find the end. Save about every 2.5 seconds.
+   * loadFinished indicates a stable scroll edge. completeness stays unverified.
+   * Try to save partial content in finally after a timeout, stop, or error.
+   */
+  async function capture(item,read){
+    const prior=records.get(item.url),map=new Map(),order=[];let row=null,stage='up',signature='',stableSince=Date.now(),lastSave=0,emptySince=null;
+    const start=Date.now();
+    try{while(!stopped&&Date.now()-start<CAPTURE_TIMEOUT){
+      guard();const doc=read();if(!doc){await sleep(POLL);continue;}guard(doc);
+      const current=snapshot(doc),scroll=conversationScroll(doc);if(!scroll)throw new Error('Conversation scroll area not detected. Open a conversation and click Check Page Detection.');
+      if(!current.length){emptySince??=Date.now();if(Date.now()-emptySince>45000)throw new Error('No messages detected. Check that the reader window loaded, then use Check Page Detection.');await sleep(POLL);continue;}
+      emptySince=null;merge(order,map,current,stage==='up'?'prepend':'append');
+      const atEdge=stage==='up'?scroll.scrollTop<=5:scroll.scrollTop+scroll.clientHeight>=scroll.scrollHeight-8;
+      const sig=stage+'|'+current.map(m=>m.key+':'+hash(m.text)).join('|')+'|'+scroll.scrollHeight;
+      if(sig!==signature||!atEdge||isLoading(doc,scroll))stableSince=Date.now();signature=sig;
+      const stable=atEdge&&!isLoading(doc,scroll)&&Date.now()-stableSince>=WAIT_STABLE;
+      const finished=stage==='down'&&stable;
+      row={platform,accountLabel:profile,url:item.url,title:item.title||doc.title,capturedAt:new Date().toISOString(),messages:order.map(k=>map.get(k)),loadFinished:finished,completeness:'unverified',stopReason:finished?'Scroll pass ended. Verify completeness.':'Partial capture. Scroll pass still in progress.'};
+      if(Date.now()-lastSave>=2500||finished){await save(row,prior);lastSave=Date.now();}
+      update('Scrolling '+stage+' in “'+item.title+'”: '+map.size+' messages.');
+      if(finished)break;
+      if(stage==='up'&&stable){stage='down';stableSince=Date.now();signature='';}
+      move(scroll,stage==='up'?Math.max(0,scroll.scrollTop-Math.max(300,scroll.clientHeight*0.75)):Math.min(scroll.scrollHeight,scroll.scrollTop+Math.max(300,scroll.clientHeight*0.75)));
+      await sleep(POLL);
+    }}finally{if(row){if(stopped||!row.loadFinished){row.loadFinished=false;row.stopReason=stopped?'Stopped by user. Captured messages were retained.':'Timed out or encountered a page error. Partial messages were retained.';}await save(row,prior);}}
+    if(!row&&!stopped)throw new Error('No messages captured. No empty record was created.');return records.get(item.url);
+  }
+  /*
+   * Read only same-origin DOM and stop if the browser isolates the reader.
+   */
+  function childDoc(url){
+    if(!reader||reader.closed)throw new Fatal('The reader window closed or was isolated by the browser. Open a conversation and use Read and Download Current Conversation.');
+    try{const doc=reader.document;if(doc.URL==='about:blank')return null;return urlOf(doc.URL)===url&&doc.readyState!=='loading'?doc:null;}
+    catch{throw new Fatal('The browser blocked access to the reader window. Keep both pages on the same site and account, or use Read and Download Current Conversation.');}
+  }
+  /*
+   * Reuse one reader window and wait for the target URL and its messages before capturing.
+   */
+  async function collect(item){update('Opening “'+item.title+'” in the reader window.');reader.location.href=item.url;const start=Date.now();let doc=null,lastNotice=0;
+    while(!stopped&&Date.now()-start<PAGE_TIMEOUT){doc=childDoc(item.url);if(doc&&snapshot(doc).length)break;
+      if(Date.now()-lastNotice>=2000){update('Waiting for “'+item.title+'”: '+Math.floor((Date.now()-start)/1000)+' seconds. '+(doc?'The target conversation is open. Waiting for messages.':'The reader has not reached the conversation. Check for sign-in prompts, error pages, or connection issues.'));lastNotice=Date.now();}
+      await sleep(POLL);}
+    if(stopped)return null;if(!doc||!snapshot(doc).length)throw new Error('Timed out loading messages. Check whether the reader window shows the target conversation, a sign-in page, or an error.');
+    return capture(item,()=>childDoc(item.url));
+  }
+  /*
+   * Continue after a conversation fails. Prefer links without previous failures on the next run.
+   * Pause immediately on account changes, reader isolation, or local storage failures.
+   * Each automatic batch contains content newly saved during the current run.
+   */
+  async function run(limit=Infinity){
+    remember();const queue=[...found.values()].filter(item=>!records.get(item.url)?.loadFinished)
+      .sort((a,b)=>Number(failures.has(a.url))-Number(failures.has(b.url))).slice(0,Number.isFinite(limit)?limit:undefined);
+    let processed=0,successful=0,parts=0,fatal=null,lastError='';
+    const batch=new Map();
+    const flush=()=>{if(!batch.size)return;download('md',[...batch.values()],parts?'body-part-'+(parts+1):'first-body');parts++;batch.clear();};
+    try{
+      for(const item of queue){if(stopped)break;const before=records.get(item.url);
+        try{const row=await collect(item);if(!validRecord(row)&&!stopped)throw new Error('No valid messages captured.');if(validRecord(row)){failures.delete(item.url);successful++;}}
+        catch(error){lastError=error.message;failures.set(item.url,{...item,error:lastError,at:new Date().toISOString()});if(error instanceof Fatal)fatal=error;}
+        const saved=records.get(item.url);if(validRecord(saved)&&saved!==before)batch.set(item.url,{...saved,platform,accountLabel:profile});
+        await persist();processed++;
+        if(batch.size&&(!parts||batch.size>=20))flush();
+        update('Processed '+processed+'/'+queue.length+'. Conversations captured: '+successful+'. Markdown files generated: '+parts+'. Click a file link to download.');
+        if(fatal||stopped)break;
+      }
+    }finally{flush();}
+    if(fatal)throw new Error('Reading paused: '+fatal.message+'. Saved conversations can still be exported in batches.');
+    if(!queue.length){update('No links are queued. Use Download Saved Conversations in Batches to export existing records.');return;}
+    update((stopped?'Stopped. ':'Read pass ended. ')+(parts?'Generated '+parts+' Markdown files. Check your downloads or click the file links. ':'No new files generated. ')+(lastError?' Latest error: '+lastError:'')+(failures.size?' Failed conversations: '+failures.size+'. Resume reading to retry.':''));
+  }
+  /*
+   * Scan before reading when requested, or read already discovered links.
+   */
+  async function backup(scanMore=false,limit=Infinity){
+    
+    if(stopped)return;
+    remember();if(!found.size)throw new Error('No conversation links found. Expand the history sidebar or open a conversation and try again.');
+    phase='Reading and downloading conversations';await run(limit);
+  }
+  /*
+   * Read the current conversation and stop if its URL changes.
+   */
+  async function current(){guard();const url=urlOf(location.href);
+    if(!url)throw new Error('No conversation is open. Open one from the sidebar and rerun the script, or choose Test Read and Download One Conversation.');
+    const item={url,title:document.title};found.set(url,item);
+    if(!snapshot(document).length)throw new Error('No messages detected on this page. Wait for the conversation to load or click Check Page Detection.');
+    const before=records.get(url);try{await capture(item,()=>{if(urlOf(location.href)!==url)throw new Error('The page changed. Reading stopped and captured messages from the original conversation were retained.');return document;});}
+    finally{const row=records.get(url);if(validRecord(row)&&row!==before)download('md',[{...row,platform,accountLabel:profile}],'current-body');}
+    await persist();update(records.get(url)!==before?'Current conversation file generated. Check your downloads and verify the first and last messages.':'No new messages were saved and no file was generated.');
+  }
+  /*
+   * Keep the 30 most recent file links for manual download retries.
+   * File links expire on refresh or close. Saved conversations can be exported again.
+   * Check the browser download list to confirm the file reached disk.
+   */
+  const fileLinks=add('details');fileLinks.open=true;
+  const fileSummary=document.createElement('summary');fileSummary.textContent='Files generated on this page';
+  fileLinks.append(fileSummary);const generatedFiles=[];
+  function offerFile(blob,name){
+    const url=URL.createObjectURL(blob),a=document.createElement('a'),line=document.createElement('div');
+    a.href=url;a.download=name;a.textContent=name+' ('+Math.ceil(blob.size/1024)+' KB, click to download)';
+    a.style.cssText='display:block;overflow-wrap:anywhere;color:#245b9e;margin:7px 0';
+    line.append(a);fileLinks.append(line);generatedFiles.push({url,line});
+    while(generatedFiles.length>30){const old=generatedFiles.shift();URL.revokeObjectURL(old.url);old.line.remove();}
+    try{a.click();}catch(error){showHint('Automatic download request failed: '+error.message+'. Click the file link to download it manually.');}
+    return {name,bytes:blob.size,status:'requested-not-confirmed'};
+  }
+  button('Test Markdown Download',()=>{
+    offerFile(new Blob(['# Download Test\n\nThis file tests downloads and contains no conversation messages.\n'],{type:'text/markdown;charset=utf-8'}),'AI-Backup-download-test.md');
+    showHint('Check your downloads. If the file is missing, click its link above. This test only checks file downloads.');
+  },{always:true});
+  const limitations=['Only the active conversation branch is captured, and completeness is unverified','History may omit archived, project, or unloaded conversations','Original images, attachments, and media files are excluded'];
+  /*
+   * JSON preserves structure, status, and earlier passes. Markdown is intended for reading.
+   * A download request does not confirm that the browser saved the file.
+   */
+  function download(type,selected=null,label='all-body'){const rows=(selected||allRows()).filter(validRecord);if(!rows.length){update('No saved messages. No empty file was generated.');return;}
+    const chunks=[];let extension,mime;
+    if(type==='json'){
+      // Serialize records individually to avoid building one huge account-wide string. Very long conversations still require browser memory.
+      const meta={format:'ai-chat-dom-backup-v1',scriptVersion:VERSION,exportedAt:new Date().toISOString(),platform,accountLabel:profile,discoveryStatus:discovery,discovered:[...found.values()],failures:[...failures.values()],limitations};
+      chunks.push(JSON.stringify(meta).slice(0,-1));
+      for(const [field,store] of [['conversations',records],['importedConversations',imports]]){
+        chunks.push(',"'+field+'":[');let first=true;
+        for(const r of store.values())if(validRecord(r)){if(!first)chunks.push(',');chunks.push(new Blob([JSON.stringify(r)]));first=false;}
+        chunks.push(']');
+      }
+      chunks.push('}');extension='json';mime='application/json';
+    }else{
+      chunks.push('# AI Chat Backup\n\nExported: '+new Date().toISOString()+'\n\nThis file contains '+rows.length+' conversations and '+rows.reduce((n,r)=>n+r.messages.filter(hasText).length,0)+' captured messages.\n\n'+limitations.join('. ')+'.');
+      for(const r of rows){
+        chunks.push('\n\n---\n\n# '+(r.title||'Untitled')+'\n\nPlatform: '+r.platform+'. Account label: '+r.accountLabel+'\n\n'+r.url+'\n\nRead status: '+(r.loadFinished?'Read ended. Verify completeness.':'Partial capture. Review needed.'));
+        for(const m of r.messages)if(hasText(m))chunks.push('\n\n## '+(m.role==='user'?'User':m.role==='assistant'?'AI':m.role)+'\n\n',m.markdown?.trim()?m.markdown:m.text);
+      }
+      extension='md';mime='text/markdown';
+    }
+    const blob=new Blob(chunks,{type:mime+';charset=utf-8'});
+    offerFile(blob,'AI-Backup-'+platform+'-v3-'+label+'-'+Date.now()+'.'+extension);
+    update('Generated a file with '+rows.length+' conversations and '+blob.size+' bytes. Check your browser downloads or click the file link in the panel.');
+  }
+  // Generate one manual batch per click so the browser can handle each request.
+  // Manual batches contain up to 20 records in current save order and can differ from automatic batches.
+  function manualMarkdown(){
+    const rows=allRows(),total=Math.ceil(rows.length/20);if(!total){update('No saved conversations.');return;}
+    const answer=total===1?'1':prompt('Saved conversations: '+rows.length+'. Each batch contains up to 20 conversations in save order. Enter a batch number (1–'+total+'). Repeat to download other batches.','1');
+    if(answer===null)return;const n=Number(answer);
+    if(!Number.isInteger(n)||n<1||n>total){update('Enter a whole number between 1 and '+total+'.');return;}
+    download('md',rows.slice((n-1)*20,n*20),'saved-'+n+'-of-'+total);
+  }
+  /*
+   * The audit can be exported before reading messages. It includes IDs, counts, excerpts, and errors.
+   * Dates without a reliable source are marked unknown.
+   */
+  function downloadAudit(){
+    const entries=[...found.values()].map(item=>{const r=records.get(item.url);return {...item,id:chatId(item.url),status:r?(r.loadFinished?'read-ended-unverified':'partial'):'not-read',messages:r?.messages.length||0,first:r?.messages[0]?.text?.slice(0,160)||'',last:r?.messages.at(-1)?.text?.slice(-160)||'',previousPasses:r?.previousPasses?.length||0,error:failures.get(item.url)?.error||null,date:'unknown'};});
+    const blob=new Blob([JSON.stringify({version:VERSION,exportedAt:new Date().toISOString(),accountLabel:profile,discoveryStatus:discovery,entries},null,2)],{type:'application/json'});
+    offerFile(blob,'AI-Backup-audit-'+Date.now()+'.json');
+    update('Audit download requested. Dates without a reliable source are marked unknown.');
+  }
+  button('Download Audit (IDs, Excerpts, and Failures)',downloadAudit,{always:true});
+  /*
+   * Start by scanning history, then test one download before reading in bulk.
+   */
+  const startButton=button('Scan History',scan);startButton.className='primary';
+  button('Test Read and Download One Conversation',()=>backup(false,1),{popup:true});
+  button('Read Discovered Conversations',()=>backup(),{popup:true});
+  button('Read and Download Current Conversation',current);
+  button('Stop',()=>{stopped=true;update('Stopping and saving captured messages. Wait for the controls to become available.');},{always:true});
+  button('Check Page Detection',()=>{
+    remember();const m=snapshot(document),url=urlOf(location.href);
+    showHint((url?'A conversation is open':'No conversation is open. Try Test Read and Download One Conversation')+'. User messages detected: '+m.filter(x=>x.role==='user').length+'. AI replies detected: '+m.filter(x=>x.role==='assistant').length+'. Saved conversations: '+records.size+'. '+(url&&!m.length?'If messages are visible but the counts are zero, capture a screenshot of the page layout for troubleshooting.':''));
+  },{always:true});
+  // Export the saved snapshot without resetting the active scan or read.
+  button('Download Saved Markdown Now',()=>download('md',allRows(),'saved-now'),{always:true,download:true});
+  button('Download Saved Conversations in Batches',manualMarkdown,{always:true,download:true});
+  button('Download JSON Backup',()=>download('json'),{always:true,download:true});
+  button('Mark All for Re-reading',async()=>{for(const [url,r] of records){const row={...r,loadFinished:false};await persist(row);records.set(url,row);}await persist();update('Saved messages were retained and marked for re-reading.');});
+  const help=add('p','This version resumes from the v3.6 database. Click Scan History to find conversations. At the bottom of the list, scanning keeps checking for older links until you click Stop. Use Download Saved Markdown Now at any time to export saved conversations while the current task continues. After stopping the scan, click Read Discovered Conversations. Automatic Markdown downloads cover the first successful read, then batches of 20, and any final remainder. Check your downloads or click one of the 30 most recent file links. Use Download Saved Conversations in Batches for older records.');help.style.cssText='color:#89909d;font-size:12px;margin-top:14px';
+  document.body.append(panel);remember();await persist();
+  const last=[...records.values()].at(-1);if(last)showPreview(last);
+  update('Local v3.6 progress: '+found.size+' links and '+records.size+' saved conversations. Earlier databases were not imported.');
+})().catch(error=>{console.error('[AI Chat Backup v3]',error);alert('Backup tool: '+error.message);});
