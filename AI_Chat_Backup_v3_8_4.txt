@@ -1,0 +1,632 @@
+/*
+AI 聊天备份 v3.8
+
+【扫描路径】
+从网页左侧聊天列表的顶部开始，按页面显示的从新到旧顺序逐篇检查。
+这里不从标题猜测日期，也不按本地数据库写入时间排序；置顶记录等仍遵循网页显示位置。
+
+【本地检查】
+“本地”指当前浏览器、当前网站、当前账号标签对应的 IndexedDB 备份数据库。
+脚本不会搜索电脑的下载文件夹，已有 Markdown 文件不作为跳过依据。
+仅有链接不能跳过；只有正文非空、链接和账号匹配、读取结束标记为真，才能跳过重读。
+如果只读了一部分，即使已有很多文字，也会继续按未完成处理。
+
+【操作与导出】
+运行方法：在已登录的 Gemini 或 ChatGPT 网页的开发者工具 Console 粘贴全文。
+三个按钮：开始扫描、停止扫描、下载阶段性 Markdown。
+流程：从侧栏顶部最新记录开始 → 检查本地正文 → 已有且读取结束则跳过；否则保存链接、读取并保存正文 → 下一篇。
+严格沿侧栏从上到下处理，不再按旧数据库中的待补读清单抢先读取。
+当前篇未读取完成或保存失败时，留在当前篇重试；不会跳过后继续累计新链接。
+每篇保存后从数据库读回，核对原链接、账号、非空问答与写入内容；验证通过才进入下一篇。
+导出前逐链接检查正文，统计已读完、部分正文、缺失正文，并在各篇下写明核对结果。
+没有新链接、列表触底、加载超时都不会自动结束任务；只有手动停止才结束运行。
+停止后生成一个包含全部已保存链接和正文的大 Markdown；过程中可随时下载阶段性文件。
+阶段性下载不停止任务。没有正文的链接、未完成的正文都会明确标记，避免当作完整备份。
+沿用 v3.6 / v3.7 本地进度：同一浏览器、同一网站、同一账号标签可续跑，不删除旧数据。
+本地只有链接或部分正文不能算完成，仍会读取；已有且读取结束的正文不重复抓取，也不会自动同步后来新增的消息。
+旧正文仍保留，读取的新版本不会直接抹掉较长的旧版本。
+面板显示链接数、正文数、当前链接、当前篇累计用时（含等待及重试）及正在读取的正文。
+正文至少完成两轮上下滚动；后续整轮没有新增或变化的消息且无加载标记，才进入下一篇。
+Markdown 按篇排列：标题、完整原链接、读取状态、用时、消息数及本篇问答文字放在一起，不再另列总链接清单。
+只使用网页显示内容，不调用隐藏接口。
+请保留主页面及正文读取窗口。关闭页面、浏览器休眠或登录失效可能阻止运行，脚本不能绕过这些限制。
+“本轮读取结束”指上下边缘稳定，并非服务器全量历史或正文完整性的保证；附件原文件不包含在内。
+*/
+(async () => {
+  'use strict';
+  const VERSION='3.8', PANEL='ai-chat-backup-universal', DB='ai-chat-backup-fresh-v36';
+  // VERSION 是面板与导出文件使用的版本号；DB 沿用旧进度库，不随本次流程调整清空。
+  // CONTROL 是当前页面中的任务句柄，重复粘贴时用它先停止旧实例，避免双重扫描。
+  const CONTROL='__aiChatBackupV38';
+  // 时间统一为毫秒：正文边缘稳定等待 6 秒，每 0.5 秒观察一次。
+  // 单次页面加载等待 90 秒后会重试同一篇，不表示跳过；重试间隔从 5 秒增加到最多 30 秒。
+  // 没有“整项任务超过几分钟就自动结束”的时间上限。
+  const WAIT_STABLE=6000, POLL=500, PAGE_TIMEOUT=90000, RETRY_MIN=5000, RETRY_MAX=30000;
+  const host=location.hostname, ORIGIN=location.origin;
+  const platform=host==='gemini.google.com'?'gemini':(['chatgpt.com','chat.openai.com'].includes(host)?'chatgpt':null);
+  if(!platform)throw new Error('请在已登录的 Gemini 或 ChatGPT 网页运行。');
+  const NAME=platform==='gemini'?'Gemini':'ChatGPT';
+  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+  // 重新粘贴前先停止本版任务；不能让两个扫描器同时修改进度。
+  const previous=window[CONTROL];
+  if(previous){await previous.dispose();}
+  const oldPanel=document.getElementById(PANEL);
+  if(oldPanel){
+    const buttons=[...oldPanel.querySelectorAll('button')];
+    const stop=buttons.find(b=>/^(停止|停止扫描)$/.test(b.textContent.trim()));
+    const running=()=>buttons.some(b=>b.disabled&&!/下载|停止/.test(b.textContent));
+    if(running()){
+      stop?.click();
+      for(let i=0;i<160&&running();i++)await sleep(250);
+      if(running())throw new Error('旧版还在运行，请先停止旧版任务并等它保存完毕，再粘贴 v3.8。');
+    }
+    oldPanel.remove();
+  }
+
+  function email(doc){
+    if(platform!=='gemini')return null;
+    for(const el of doc.querySelectorAll('[aria-label]')){
+      const label=el.getAttribute('aria-label')||'';
+      if(!/Google Account|Google 帐号|Google 账号|Google账户/i.test(label))continue;
+      const match=label.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+      if(match)return match[0].toLowerCase();
+    }return null;
+  }
+  const observed=email(document);
+  const profile=prompt('当前 '+NAME+' 账号／工作区的固定标签（可填写邮箱）。\n续跑请填写与之前相同的标签；切换账号请换标签。',observed||localStorage.getItem('ai-chat-backup-profile-'+platform)||'')?.trim();
+  if(!profile)return;
+  if(observed&&profile.includes('@')&&profile.toLowerCase()!==observed)throw new Error('填写的邮箱与当前 Gemini 账号不一致。');
+  localStorage.setItem('ai-chat-backup-profile-'+platform,profile);
+  const scope=platform+'\n'+profile;
+  let stopped=true,running=false,disposing=false,reader=null,task=null,phase='就绪',notice='';
+  let currentItem=null,sessionLinks=0,sessionBodies=0,sessionSkipped=0,previewSignature='';
+  let linkStartedAt=null,elapsedTimer=null,frozenElapsed=0,linkTimingActive=false;
+  // found：已知链接与标题，不能用它判断正文是否存在。
+  // records：本账号已保存的正文；imports：历史导入内容；failures：当前需要重试的问题。
+  // Map 以链接为键去重，所以同一个链接不会因为反复滚动而重复增加累计数量。
+  const found=new Map(),records=new Map(),imports=new Map(),failures=new Map();
+  let discovery='尚未开始；全量历史完整性未核验';
+  const hasText=m=>!!m&&(typeof m.text==='string'&&!!m.text.trim()||typeof m.markdown==='string'&&!!m.markdown.trim());
+  const validRecord=r=>Array.isArray(r?.messages)&&r.messages.some(hasText);
+  const textSize=r=>(r?.messages||[]).reduce((n,m)=>n+Math.max(m.text?.length||0,m.markdown?.length||0),0);
+  function urlOf(input,p=platform){
+    try{const u=new URL(input,ORIGIN);u.search='';u.hash='';
+      if(p==='gemini'&&u.hostname==='gemini.google.com'&&/^\/(?:u\/\d+\/)?app\/[\w-]+\/?$/.test(u.pathname))return u.href.replace(/\/$/,'');
+      if(p==='chatgpt'&&['chatgpt.com','chat.openai.com'].includes(u.hostname)&&/^\/(?:g\/[^/]+\/)?c\/[\w-]+\/?$/.test(u.pathname))return u.href.replace(/\/$/,'');
+    }catch{}return null;
+  }
+  function guard(doc=document){
+    if(new URL(doc.URL).origin!==ORIGIN)throw new Error('页面已离开原网站，等待恢复原网站与登录状态。');
+    const account=email(doc);
+    if(observed&&account&&account!==observed)throw new Error('检测到账号变化，等待恢复原账号；不会读取另一个账号的正文。');
+  }
+  // 等待可以被“停止扫描”打断，避免停止按钮要等到整个超时结束才生效。
+  async function pause(ms){const until=Date.now()+ms;while(!stopped&&Date.now()<until)await sleep(Math.min(250,until-Date.now()));}
+
+  // 链接与正文按账号分开存储。每一步等待事务完成后，才允许进入下一步。
+  const db=await new Promise((resolve,reject)=>{
+    const request=indexedDB.open(DB,1);
+    request.onupgradeneeded=()=>{for(const name of ['state','records','imports'])if(!request.result.objectStoreNames.contains(name))request.result.createObjectStore(name);};
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(new Error('无法打开本地进度：'+request.error));
+    request.onblocked=()=>reject(new Error('数据库被旧页面占用，请关闭旧备份页面后重试。'));
+  });
+  const get=(store,key)=>new Promise((resolve,reject)=>{
+    const request=db.transaction(store).objectStore(store).get(key);
+    request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);
+  });
+  const state=await get('state',scope);
+  for(const item of state?.discovered||[]){const url=urlOf(item.url);if(url&&new URL(url).origin===ORIGIN)found.set(url,{url,title:String(item.title||'未命名对话')});}
+  for(const key of state?.savedUrls||[]){
+    const url=urlOf(key);if(!url||new URL(url).origin!==ORIGIN)continue;
+    const row=await get('records',scope+'\n'+key);
+    if(validRecord(row)){records.set(url,{...row,url});if(!found.has(url))found.set(url,{url,title:row.title||'未命名对话'});}
+  }
+  // 保留已有导入索引与正文，不因界面简化而删除旧数据。
+  for(const key of state?.importKeys||[]){const row=await get('imports',scope+'\n'+key);if(validRecord(row))imports.set(key,row);}
+  for(const f of state?.failures||[])failures.set(f.url,f);
+  let pendingSave=Promise.resolve();
+  const dirtyRecords=new Map();
+  function persist(row){
+    // 保存失败的正文保留在待写集合；下一次事务（包括停止时）会再次尝试，
+    // 避免只保存了 savedUrls 索引、却漏写对应正文。
+    if(row)dirtyRecords.set(row.url,row);
+    const write=pendingSave.then(()=>new Promise((resolve,reject)=>{
+      const tx=db.transaction(['state','records'],'readwrite');
+      const writing=[...dirtyRecords.entries()];
+      for(const [url,value] of writing)tx.objectStore('records').put(value,scope+'\n'+url);
+      tx.objectStore('state').put({discovered:[...found.values()],savedUrls:[...records.keys()],importKeys:[...imports.keys()],failures:[...failures.values()],discovery,updatedAt:new Date().toISOString()},scope);
+      tx.oncomplete=()=>{for(const [url,value] of writing)if(dirtyRecords.get(url)===value)dirtyRecords.delete(url);resolve();};tx.onerror=()=>reject(new Error('本地保存失败：'+tx.error));
+      tx.onabort=()=>reject(new Error('本地保存中断，请保留页面并下载阶段性 Markdown。'));
+    }));
+    pendingSave=write.catch(()=>{});return write;
+  }
+
+  // 只显示用户指定的三个操作按钮，运行时保留阶段性下载入口。
+  const panel=document.createElement('aside');panel.id=PANEL;
+  panel.style.cssText='position:fixed;right:16px;top:16px;width:410px;max-width:calc(100vw - 64px);max-height:88vh;overflow:auto;z-index:2147483647;padding:18px;background:#fff;color:#263243;border:1px solid #dce2ea;border-radius:14px;box-shadow:0 8px 35px #0002;font:13px/1.6 system-ui;color-scheme:light';
+  const style=document.createElement('style');style.textContent=`#${PANEL} button{font:inherit;padding:9px 12px;margin:4px 5px 4px 0;border:1px solid #d6dce5;border-radius:8px;background:#fff;color:#263243;cursor:pointer}#${PANEL} button:disabled{opacity:.45;cursor:default}#${PANEL} button.primary{background:#303b4d;color:#fff}#${PANEL} a{color:#245b9e;overflow-wrap:anywhere}#${PANEL} pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 system-ui}`;panel.append(style);
+  const add=(tag,text,parent=panel)=>{const el=document.createElement(tag);if(text)el.textContent=text;parent.append(el);return el;};
+  add('strong','AI 聊天备份 v'+VERSION+' · '+NAME);
+  add('p','账号标签：'+profile).style.cssText='font-size:12px;color:#758093';
+  // 上行统计本次启动；下行含此前续跑的记录，避免把旧进度误当作本轮新增。
+  const counts=add('p');counts.style.cssText='white-space:pre-line;background:#f4f6f9;padding:10px;border-radius:8px';
+  const status=add('p');status.style.cssText='white-space:pre-line';status.setAttribute('role','status');
+  const actions=add('div');
+  const startButton=add('button','开始扫描',actions);startButton.className='primary';
+  const stopButton=add('button','停止扫描',actions);
+  const downloadButton=add('button','下载阶段性 Markdown',actions);
+  const currentLabel=add('p','当前：尚未开始');
+  const elapsedLabel=add('p','当前链接用时：0 秒');
+  const currentLink=add('a');currentLink.target='_blank';currentLink.rel='noopener noreferrer';
+  const bodyBox=add('details');bodyBox.open=true;
+  add('summary','当前正在读取的正文',bodyBox);
+  const preview=add('pre','尚未读取正文。',bodyBox);preview.style.cssText='max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere';
+  const files=add('div');
+  const help=add('p','从侧栏顶部最新记录开始，先核对本地正文；已有且读取结束则跳过，缺失或部分正文逐篇补读。到当前列表底部仍会等待和重试。点击停止后生成完整汇总；阶段性下载不停止扫描。请保持主页面及读取窗口打开。');help.style.cssText='font-size:12px;color:#758093';
+  document.body.append(panel);
+
+  function update(message){
+    if(message!==undefined)notice=message;
+    const completed=[...records.values()].filter(r=>r.loadFinished).length;
+    counts.textContent='本次扫描：'+sessionLinks+' 个链接；本次读取结束：'+sessionBodies+' 个正文；本地已有跳过：'+sessionSkipped+' 篇\n累计保留：'+found.size+' 个链接；'+records.size+' 个正文（读取结束 '+completed+'，部分 '+(records.size-completed)+'）'+(imports.size?'\n另有历史导入正文：'+imports.size+' 个':'');
+    counts.textContent+='\n'+auditSummary(auditLinks());
+    status.textContent='状态：'+phase+(notice?'\n'+notice:'');
+    startButton.disabled=running;stopButton.disabled=!running||stopped;
+    downloadButton.disabled=!found.size&&!records.size&&!imports.size;
+  }
+  // 计时从选中当前链接开始，重试不清零；停止后冻结，下一篇才重新计时。
+  function elapsedSeconds(){return linkStartedAt===null?0:Math.floor(((running&&!stopped&&linkTimingActive?Date.now():frozenElapsed)-linkStartedAt)/1000);}
+  function updateElapsed(){elapsedLabel.textContent='当前链接用时：'+Math.max(0,elapsedSeconds())+' 秒（含等待和重试）';}
+  // 切换当前篇时立即清空旧预览，避免页面仍显示上一篇的正文。
+  function selectItem(item){
+    currentItem=item;linkTimingActive=true;linkStartedAt=Date.now();frozenElapsed=linkStartedAt;updateElapsed();previewSignature='';currentLabel.textContent='当前：'+item.title;
+    currentLink.href=item.url;currentLink.textContent=item.url;
+    preview.textContent='链接已选中，正在核对本地是否已有正文。';
+  }
+  // 只有正文变化时才刷新预览；不修改用户正在看的原始聊天 DOM。
+  function showPreview(row){
+    const signature=row.messages.map(m=>m.key+':'+hash(m.text||m.markdown||'')).join('|');
+    if(signature===previewSignature)return;previewSignature=signature;
+    preview.textContent=row.messages.filter(hasText).map(m=>(m.role==='user'?'我':'AI')+'：\n'+(m.markdown||m.text)).join('\n\n────────\n\n');
+  }
+  function hash(text){let n=2166136261;for(let i=0;i<text.length;i++)n=Math.imul(n^text.charCodeAt(i),16777619);return (n>>>0).toString(16)+'-'+text.length;}
+  /*
+   * 把网页节点递归转换为 Markdown。递归就是函数逐层处理子节点。
+   * 仅处理可读文字与部分格式；列表嵌套、引用、复杂公式可能失真，图片附件不含原文件。
+   */
+  function markdown(root){
+    function walk(node){if(node.nodeType===3)return node.textContent;if(node.nodeType!==1)return '';
+      if(node.matches('script,style,button,svg,.sr-only,.cdk-visually-hidden,.katex-html'))return '';
+      if(node.matches('.katex')){const tex=node.querySelector('annotation[encoding="application/x-tex"]');return tex?' $'+tex.textContent+'$ ':node.textContent;}
+      const tag=node.tagName.toLowerCase(),body=()=>[...node.childNodes].map(walk).join('');
+      if(tag==='br')return '\n';
+      if(tag==='pre'){const text=(node.querySelector('code')||node).textContent,ticks='`'.repeat(Math.max(3,...(text.match(/`+/g)||[]).map(s=>s.length+1)));return '\n\n'+ticks+'\n'+text+'\n'+ticks+'\n\n';}
+      if(tag==='code'){const ticks='`'.repeat(Math.max(1,...(node.textContent.match(/`+/g)||[]).map(s=>s.length+1)));return ticks+' '+node.textContent+' '+ticks;}
+      if(/^h[1-6]$/.test(tag))return '\n\n'+'#'.repeat(+tag[1])+' '+body()+'\n\n';
+      if(tag==='a')return '['+body()+']('+(node.getAttribute('href')||'')+')';
+      if(tag==='img')return '\n[图片：'+(node.alt||'原文件未下载')+']\n';
+      if(['strong','b'].includes(tag))return '**'+body()+'**';
+      if(['em','i'].includes(tag))return '*'+body()+'*';
+      if(tag==='li')return '\n- '+body().trim()+'\n';
+      if(tag==='table'){
+        const rows=[...node.querySelectorAll('tr')].map(tr=>[...tr.children].map(c=>walk(c).trim().replace(/\|/g,'\\|').replace(/\n/g,' ')));
+        if(!rows.length)return '';const width=Math.max(...rows.map(r=>r.length)),row=r=>'| '+Array.from({length:width},(_,i)=>r[i]||'').join(' | ')+' |';
+        return '\n\n'+row(rows[0])+'\n'+row(Array(width).fill('---'))+'\n'+rows.slice(1).map(row).join('\n')+'\n\n';
+      }
+      return ['p','div','section','ul','ol','blockquote'].includes(tag)?'\n\n'+body()+'\n\n':body();
+    }return walk(root).replace(/\n[ \t]+/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+  }
+  /*
+   * 正文快照：找到当前DOM中的提问和回答，按页面顺序排列。
+   * 先克隆节点，再移除按钮、辅助读屏文字等；这样不会修改原聊天正文。
+   * 有稳定消息ID时用ID识别；没有ID时使用角色、文字哈希和本快照出现次数，重复消息仍可能误判。
+   */
+  function snapshot(doc){
+    let nodes;
+    if(platform==='gemini'){
+      const users=[...doc.querySelectorAll('.query-text')];
+      if(!users.length)users.push(...doc.querySelectorAll('user-query .query-text-line,user-query .user-query-container'));
+      let answers=[...doc.querySelectorAll('message-content .markdown-main-panel')];
+      if(!answers.length)answers=[...doc.querySelectorAll('model-response message-content')];
+      if(!answers.length)answers=[...doc.querySelectorAll('model-response .response-container-content,model-response .markdown-main-panel')];
+      nodes=[...users.map(n=>({node:n,role:'user'})),...answers.map(n=>({node:n,role:'assistant'}))];
+    }else{
+      nodes=[...doc.querySelectorAll('[data-message-author-role="user"],[data-message-author-role="assistant"]')].map(node=>({node,role:node.getAttribute('data-message-author-role')}));
+      if(!nodes.length)nodes=[...doc.querySelectorAll('article[data-turn="user"],article[data-turn="assistant"]')].map(node=>({node,role:node.getAttribute('data-turn')}));
+    }
+    nodes=nodes.filter(({node},i,all)=>!node.closest('#'+PANEL)&&!all.some((x,j)=>j!==i&&x.node!==node&&x.node.contains(node)));
+    nodes.sort((a,b)=>a.node===b.node?0:(a.node.compareDocumentPosition(b.node)&4?-1:1));
+    const seen=new Map();
+    return nodes.map(({node,role})=>{
+      const copy=node.cloneNode(true);copy.querySelectorAll('script,style,button,svg,.sr-only,.cdk-visually-hidden').forEach(n=>n.remove());
+      const text=copy.textContent.trim(),md=markdown(copy);
+      const owner=platform==='gemini'?(role==='user'?(node.closest('[id^="user-query-content-"]')||node.closest('user-query')||node):(node.closest('message-content')||node.closest('model-response')||node)):(node.closest('[data-message-id]')||node);
+      const id=node.getAttribute('data-message-id')||owner.getAttribute('data-message-id')||owner.id||node.id;
+      const fingerprint=role+':'+hash(text),occurrence=seen.get(fingerprint)||0;seen.set(fingerprint,occurrence+1);
+      return {key:role+':'+(id||fingerprint+':'+occurrence),role,text,markdown:md};
+    }).filter(hasText);
+  }
+  function onScreen(element){
+    if(!element?.getClientRects().length)return false;
+    const r=element.getBoundingClientRect();let left=Math.max(0,r.left),right=Math.min(window.innerWidth,r.right),top=Math.max(0,r.top),bottom=Math.min(window.innerHeight,r.bottom);
+    for(let n=element;n&&n!==document.body;n=n.parentElement){
+      const css=getComputedStyle(n);if(n.hidden||n.getAttribute('aria-hidden')==='true'||css.display==='none'||css.visibility==='hidden')return false;
+      if(n!==element){const b=n.getBoundingClientRect();if(b.width>1&&/hidden|clip|auto|scroll/.test(css.overflowX)){left=Math.max(left,b.left);right=Math.min(right,b.right);}if(b.height>1&&/hidden|clip|auto|scroll/.test(css.overflowY)){top=Math.max(top,b.top);bottom=Math.min(bottom,b.bottom);}}
+    }
+    return right-left>1&&bottom-top>1;
+  }
+  function historyRoots(){
+    const roots=[...document.querySelectorAll(platform==='gemini'?'conversations-list,#history,nav,aside,[role="navigation"]':'#history,nav,aside,[role="navigation"]')].filter(n=>!n.closest('#'+PANEL));
+    // A custom-element host can have no box while its child links are visible.
+    const visibleLinks=[...document.querySelectorAll('a[href]')].filter(a=>!a.closest('#'+PANEL)&&urlOf(a.href)&&new URL(a.href).origin===ORIGIN&&onScreen(a));
+    return [...new Set([...roots.filter(n=>onScreen(n)||visibleLinks.some(a=>n.contains(a))),...visibleLinks])];
+  }
+  /*
+   * 滚动容器可能随网站改版而改变：从历史链接的父级和候选子容器中寻找。
+   * 选错容器会导致扫描不推进，因此不能把停滞视为全量备份成功。
+   */
+  function historyScroll(){
+    const roots=historyRoots(),candidates=[],seen=new Set();
+    const add=n=>{if(n&&!seen.has(n)){seen.add(n);candidates.push(n);}};
+    // Inspect both directions: scrolling descendants and link ancestors.
+    for(const root of roots){
+      for(let n=root;n&&n!==document.body;n=n.parentElement)add(n);
+      for(const n of root.querySelectorAll('*'))if(n.clientHeight>=30&&n.scrollHeight>n.clientHeight+5)add(n);
+    }
+    const usable=candidates.filter(n=>onScreen(n)&&n.clientHeight>=30&&(/auto|scroll/.test(getComputedStyle(n).overflowY)||n.scrollTop>0));
+    const withLinks=usable.filter(n=>[...n.querySelectorAll('a[href]')].some(a=>urlOf(a.href)&&onScreen(a)));
+    return withLinks.find(n=>n.scrollHeight>n.clientHeight+5)||withLinks[0]||usable.find(n=>n.scrollHeight>n.clientHeight+5)||usable[0]||null;
+  }
+  /*
+   * 记录一次侧栏状态：可见链接、末项、滚动位置、高度和加载标记，供下一轮比较。
+   */
+  function historyFrame(sc){
+    const bounds=sc.getBoundingClientRect(),rows=[],visible=[];
+    for(const a of sc.querySelectorAll('a[href]')){const url=urlOf(a.href);if(!url||new URL(url).origin!==ORIGIN)continue;
+      const item={url,title:a.textContent.trim()||found.get(url)?.title||'未命名对话'};rows.push(item);
+      const r=a.getBoundingClientRect();if(r.height>0&&r.bottom>bounds.top&&r.top<bounds.bottom)visible.push(item);
+    }
+    const shown=visible.length?visible:rows.slice(-10);
+    return {rows,visibleCount:visible.length,signature:shown.map(r=>r.url).join('|'),tail:shown.at(-1)?.title||'未见对话链接',top:sc.scrollTop,height:sc.scrollHeight,viewport:sc.clientHeight,
+      bottom:sc.scrollTop+sc.clientHeight>=sc.scrollHeight-8,
+      loading:!!sc.querySelector('[role="progressbar"],[aria-busy="true"]')||!!document.querySelector('[aria-label="Loading conversation history"],[aria-label="Loading Gems and Recent conversations"]')};
+  }
+  function conversationScroll(doc){
+    if(platform==='gemini'){const n=doc.querySelector('infinite-scroller.chat-history');if(n)return n;}
+    const first=doc.querySelector(platform==='gemini'?'user-query,model-response,.query-text':'[data-message-author-role],article[data-turn]');
+    for(let n=first?.parentElement;n&&n!==doc.body;n=n.parentElement){const s=doc.defaultView.getComputedStyle(n);if(/auto|scroll/.test(s.overflowY)&&n.scrollHeight>n.clientHeight+5)return n;}
+    return doc.scrollingElement;
+  }
+  function isLoading(doc,scroll){return !!scroll?.querySelector('[role="progressbar"],[aria-busy="true"]')||!!doc.querySelector('[data-testid="stop-button"],[aria-label="Loading conversation"],model-response[aria-busy="true"]');}
+  function move(scroll,top){scroll.scrollTop=top;scroll.dispatchEvent(new scroll.ownerDocument.defaultView.Event('scroll',{bubbles:true}));}
+  function merge(order,map,current,direction='append'){
+    // Virtualized pages can replace every visible node between scrolls, leaving no shared anchor.
+    if(order.length&&current.length&&!current.some(row=>map.has(row.key))){
+      const keys=current.map(row=>row.key);if(direction==='prepend')order.unshift(...keys);else order.push(...keys);
+      for(const row of current)map.set(row.key,row);return;
+    }
+    let next=null;
+    for(let i=current.length-1;i>=0;i--){const row=current[i];if(!map.has(row.key)){const at=next===null?-1:order.indexOf(next);if(at<0)order.push(row.key);else order.splice(at,0,row.key);}map.set(row.key,row);next=row.key;}
+  }
+
+  // 保存多轮读取的差异。相同快照不重复积累；较长的旧正文不会被较短新快照覆盖丢弃。
+  function combinePasses(row,prior){
+    const signature=JSON.stringify(row.messages),seen=new Set([signature]),passes=[];
+    for(const p of [...(prior?.previousPasses||[]),...(validRecord(prior)?[prior]:[])]){
+      if(!validRecord(p))continue;const s=JSON.stringify(p.messages);if(seen.has(s))continue;seen.add(s);
+      passes.push({capturedAt:p.capturedAt,messages:p.messages,loadFinished:!!p.loadFinished,stopReason:p.stopReason});
+    }
+    return {...row,previousPasses:passes};
+  }
+  async function save(row,prior){
+    if(!validRecord(row))return;
+    const selected=combinePasses(row,prior);
+    // 写盘失败时仍能从当前页面下载已捕获内容，但不会继续处理下一篇。
+    records.set(row.url,selected);showPreview(row);update();await persist(selected);return selected;
+  }
+  // 必须同时核对来源、账号和具体聊天 URL，不能把尚未切换完的上一篇正文记到下一篇。
+  function childDoc(url){
+    if(!reader||reader.closed)throw new Error('正文读取窗口已关闭或被隔离。请点击停止、下载备份，再点开始扫描重新打开。');
+    let doc;try{doc=reader.document;}catch{throw new Error('无法访问正文窗口，请在该窗口恢复相同网站和原账号。');}
+    if(doc.URL==='about:blank')return null;
+    if(urlOf(doc.URL)!==url||doc.readyState==='loading')return null;
+    guard(doc);return doc;
+  }
+  // 一篇可能采用懒加载或虚拟滚动：先向上读取到开头，再向下读取到结尾。
+  // 合并滚动前后的消息，并定期保存部分正文；用户中途停止时也能导出。
+  async function capture(item){
+    const prior=records.get(item.url),map=new Map(),order=[];
+    let stage='向上',signature='',stableSince=Date.now(),lastSave=0,emptySince=null,row=null;
+    let round=1,previousRoundSignature=null;
+    try{
+      // 单篇不设总时长截止：必须上下滚动读取结束，或由用户停止。
+      while(!stopped){
+        guard();const doc=childDoc(item.url);
+        if(!doc)throw new Error('正文窗口已离开当前链接，等待重新打开本篇。');
+        const current=snapshot(doc),scroll=conversationScroll(doc);
+        if(!scroll)throw new Error('当前篇的正文滚动区未识别，稍后重试本篇。');
+        if(!current.length){
+          emptySince??=Date.now();update('本篇正文暂未显示，正在等待，不会跳到下一篇。');
+          if(Date.now()-emptySince>45000)throw new Error('当前篇暂时无法识别正文，稍后重新加载本篇。');
+          await pause(POLL);continue;
+        }
+        emptySince=null;merge(order,map,current,stage==='向上'?'prepend':'append');
+        const atEdge=stage==='向上'?scroll.scrollTop<=5:scroll.scrollTop+scroll.clientHeight>=scroll.scrollHeight-8;
+        const sig=stage+'|'+current.map(m=>m.key+':'+hash(m.text)).join('|')+'|'+scroll.scrollHeight;
+        if(sig!==signature||!atEdge||isLoading(doc,scroll))stableSince=Date.now();signature=sig;
+        const stable=atEdge&&!isLoading(doc,scroll)&&Date.now()-stableSince>=WAIT_STABLE;
+        // 一次到达底部不能直接算结束。比较两次完整上下滚动的累计消息；
+        // 如果本轮发现新消息或原消息内容变化，再完整复核一轮。
+        const endOfRound=stage==='向下'&&stable;
+        const wholeSignature=JSON.stringify(order.map(k=>{const m=map.get(k);return [k,m.text,m.markdown];}));
+        const finished=endOfRound&&previousRoundSignature!==null&&wholeSignature===previousRoundSignature;
+        row={platform,accountLabel:profile,url:item.url,title:item.title||doc.title,capturedAt:new Date().toISOString(),elapsedSeconds:Math.max(0,elapsedSeconds()),verificationRounds:round,messages:order.map(k=>map.get(k)),loadFinished:finished,completeness:'unverified',stopReason:finished?'至少两轮上下滚动复核稳定；服务器端完整性未核验':'部分正文；尚未完成读取'};
+        showPreview(row);phase='读取并保存正文';update('第 '+round+' 轮'+stage+'读取「'+item.title+'」：'+row.messages.length+' 条消息。');
+        if(Date.now()-lastSave>=2500||finished){await save(row,prior);lastSave=Date.now();}
+        if(finished)return row;
+        if(endOfRound){previousRoundSignature=wholeSignature;round++;stage='向上';stableSince=Date.now();signature='';}
+        else if(stage==='向上'&&stable){stage='向下';stableSince=Date.now();signature='';}
+        move(scroll,stage==='向上'?Math.max(0,scroll.scrollTop-Math.max(80,scroll.clientHeight*0.7)):Math.min(scroll.scrollHeight,scroll.scrollTop+Math.max(80,scroll.clientHeight*0.7)));
+        await pause(POLL);
+      }
+    }finally{
+      if(row&&!row.loadFinished){row.elapsedSeconds=Math.max(0,elapsedSeconds());row.stopReason=stopped?'用户停止；保留已读取的部分正文':'读取遇到问题；保留部分正文并重试本篇';await save(row,prior);}
+    }
+    return row;
+  }
+  // 正文窗口一次只打开一个链接。加载超时只触发当前篇重试，不会转向下一篇。
+  async function collect(item){
+    guard();if(!reader||reader.closed)throw new Error('正文窗口不可用，请停止后重新点击开始扫描。');
+    phase='打开当前链接';update('正在打开「'+item.title+'」，不会扫描下一篇。');
+    reader.location.href=item.url;
+    const since=Date.now();let doc=null;
+    while(!stopped){
+      guard();doc=childDoc(item.url);
+      if(doc&&snapshot(doc).length)break;
+      if(Date.now()-since>=PAGE_TIMEOUT)throw new Error('本篇加载超时，将继续重试本篇。');
+      update('等待当前篇正文加载：'+Math.floor((Date.now()-since)/1000)+' 秒。');await pause(POLL);
+    }
+    if(stopped)return null;
+    return capture(item);
+  }
+
+  // 不仅检查“有一个对象”，还检查正文非空、原链接一致、平台和账号一致。
+  // 有正文与全文完整是两个不同判断；仅有提问的对话也照实记录，不伪造回答。
+  function matchesLink(row,item){
+    return validRecord(row)&&urlOf(row.url)===urlOf(item.url)
+      &&(row.platform||platform)===platform&&(row.accountLabel||profile)===profile;
+  }
+  function bodyInfo(row){
+    const messages=(row?.messages||[]).filter(hasText);
+    return {messages:messages.length,users:messages.filter(m=>m.role==='user').length,
+      answers:messages.filter(m=>m.role==='assistant').length,
+      characters:messages.reduce((n,m)=>n+(m.markdown?.trim()?m.markdown:m.text||'').trim().length,0)};
+  }
+  // 每次下载前针对全部已保存链接核对，而不是用正文总数相等来猜测一一对应。
+  function auditLinks(rows=allRows()){
+    // 先建立链接索引，避免几千篇记录时每次刷新都逐对比较。
+    const index=new Map();
+    for(const row of rows)if(validRecord(row)&&(row.platform||platform)===platform&&(row.accountLabel||profile)===profile){const url=urlOf(row.url);if(url)index.set(url,row);}
+    const entries=[...found.values()].map(item=>{
+      const row=index.get(urlOf(item.url));
+      return {...item,row,info:bodyInfo(row),status:row?(row.loadFinished?'finished':'partial'):'missing'};
+    });
+    return {entries,total:entries.length,finished:entries.filter(x=>x.status==='finished').length,
+      partial:entries.filter(x=>x.status==='partial').length,missing:entries.filter(x=>x.status==='missing').length};
+  }
+  function auditSummary(a){return '逐链接核对：'+a.total+' 个链接；正文读取结束 '+a.finished+'；部分正文 '+a.partial+'；缺失正文 '+a.missing+'。';}
+  // 只有数据库读回的内容与当前保存版本一致，才能确认正文确实已存下。
+  async function verifyStoredBody(item){
+    const expected=records.get(item.url),stored=await get('records',scope+'\n'+item.url);
+    if(!matchesLink(stored,item)||!stored.loadFinished||!matchesLink(expected,item)
+      ||JSON.stringify(stored.messages)!==JSON.stringify(expected.messages)){
+      throw new Error('本篇正文保存核对未通过（正文缺失、链接不符或写入内容不一致），继续重试本篇。');
+    }
+    return stored;
+  }
+
+  // 当前篇先查本地：确认已有已读完正文，或本次读取并保存成功后，才允许处理下一篇。
+  async function processOne(item){
+    selectItem(item);let delay=RETRY_MIN,localChecked=false;
+    while(!stopped){
+      try{
+        guard();
+        if(!localChecked){
+          phase='检查本地正文';update('检查当前链接是否已有匹配且读取结束的正文。');
+          // 直接读取数据库，不能因为旧清单里有 URL 就认为正文已经保存。
+          // 存储读取失败会留在本篇重试，不会擅自按“没有正文”继续。
+          const cached=await get('records',scope+'\n'+item.url);
+          if(stopped)return;
+          if(matchesLink(cached,item))records.set(item.url,cached);
+          // 四个必要条件：确有正文、对应当前链接、属于当前账号/平台、之前已完成读取。
+          // 这里的“完成”是脚本此前的滚动核验结果，不是服务器给出的全文完整证明。
+          // 用户选择跳过本地已有正文，因此本分支不会打开聊天查看其后来是否新增消息。
+          if(matchesLink(cached,item)&&cached.loadFinished){
+            // 顺便补全链接索引、清除旧错误；即使不重新抓取，最终导出仍包含原正文。
+            found.set(item.url,item);failures.delete(item.url);await persist();
+            if(stopped)return;
+            showPreview(cached);frozenElapsed=Date.now();linkTimingActive=false;updateElapsed();
+            sessionSkipped++;update('本地已有匹配且读取结束的正文，本篇跳过，不重复打开读取。');return;
+          }
+          // 只有本地查询成功后才记为已检查。后续读取失败时重试正文，
+          // 不重新把本次刚保存的中间结果误算成“启动前就已完成的缓存”。
+          localChecked=true;
+        }
+        phase='保存当前链接';found.set(item.url,item);update('本地没有已读完正文，先保存链接，再读取本篇。');await persist();
+        if(stopped)return;
+        const row=await collect(item);
+        if(stopped)return;
+        if(!matchesLink(row,item)||!row.loadFinished)throw new Error('本篇尚未读取结束，继续处理本篇。');
+        // collect 已抓取并保存正文；再等待待写队列完成，然后从数据库读回验证。
+        // 必须确认磁盘存储返回的数据对应当前链接且内容一致，才增加本次完成数。
+        await persist();await verifyStoredBody(item);
+        failures.delete(item.url);await persist();frozenElapsed=Date.now();linkTimingActive=false;updateElapsed();sessionBodies++;update('本篇链接与非空正文已保存并读回核对，准备扫描下一篇。');return;
+      }catch(error){
+        failures.set(item.url,{...item,error:String(error.message||error),at:new Date().toISOString()});
+        phase='等待重试当前篇';update(String(error.message||error)+'\n将在 '+Math.ceil(delay/1000)+' 秒后重试；未跳过本篇。');
+        if(stopped)return;
+        await pause(delay);delay=Math.min(RETRY_MAX,delay+RETRY_MIN);
+      }
+    }
+  }
+
+  // 检查当前侧栏已经渲染的候选链接；这里不保存整批，也不提前增加扫描计数。
+  function visibleItems(){
+    const list=[],seen=new Set();
+    for(const root of historyRoots()){
+      const links=root.matches('a[href]')?[root]:root.querySelectorAll('a[href]');
+      for(const a of links){const url=urlOf(a.href);if(!url||new URL(url).origin!==ORIGIN||seen.has(url))continue;seen.add(url);list.push({url,title:a.textContent.trim()||found.get(url)?.title||'未命名对话'});}
+    }
+    return list;
+  }
+  function expandHistory(){
+    const menu=[...document.querySelectorAll('button')].find(b=>!b.closest('#'+PANEL)&&onScreen(b)&&b.getAttribute('aria-expanded')!=='true'&&/^(Main menu|Open menu|Expand menu|Open sidebar|主菜单|打开菜单|展开菜单|打开侧边栏)$/i.test((b.getAttribute('aria-label')||'').trim()));
+    menu?.click();
+  }
+  async function scan(){
+    // seen 只在本地正文核对成功或本次读取保存成功后登记；失败项不会被算作完成。
+    const seen=new Set();let nextProbe=0,probeDelay=RETRY_MIN,lastExpand=0;
+    let positionedAtTop=false,bottomProbes=0;
+    while(!stopped){
+      try{
+        guard();
+        // 无论用户此前把侧栏滚到哪里，本轮都先从顶部开始，避免直接从半途向下漏掉前面的链接。
+        const initialScroll=historyScroll();
+        if(!positionedAtTop&&initialScroll){move(initialScroll,0);positionedAtTop=true;await pause(POLL);if(stopped)break;}
+        // 唯一路径是侧栏当前顺序：从顶部向下，先新后旧。
+        // 不把旧数据库中的未读链接插队；遇到该链接时才核对和补读。
+        // 一次只登记、处理一条，当前篇返回后才选择下一条。
+        const next=visibleItems().find(x=>!seen.has(x.url));
+        if(next){
+          // sessionLinks 统计检查过的聊天链接，包括本地已有而跳过的记录。
+          // sessionBodies 只统计本次新读取结束的正文；sessionSkipped 单独统计本地命中。
+          // await 是串行保证：当前篇的本地检查/读取/保存没有返回，就不会选择下一篇。
+          sessionLinks++;phase='扫描当前链接';await processOne(next);
+          if(stopped)break;
+          seen.add(next.url);bottomProbes=0;probeDelay=RETRY_MIN;nextProbe=Date.now()+probeDelay;continue;
+        }
+        phase='继续扫描历史';
+        const sc=historyScroll(),frame=sc?historyFrame(sc):null;
+        if(!sc){
+          discovery='等待侧栏显示或恢复；任务仍在运行。';update(discovery);
+          if(Date.now()-lastExpand>=30000){expandHistory();lastExpand=Date.now();}
+          await pause(1500);continue;
+        }
+        if(!frame.bottom){
+          discovery='本屏链接已处理，继续向下寻找下一篇。';update(discovery);
+          // 每次只推进约七成屏幕，保留重叠区域，降低虚拟列表回收节点造成漏扫的机会。
+          // 下一轮重新从页面取链接，不拿已经脱离页面的旧元素继续操作。
+          move(sc,Math.min(sc.scrollHeight,sc.scrollTop+Math.max(40,sc.clientHeight*0.7)));
+        }else{
+          // 当前底部只表示网页暂时加载到这里，不能据此断言全部历史已取完。
+          discovery='到达当前已加载列表底部，持续等待和重试；不会自动结束。';update(discovery);
+          if(Date.now()>=nextProbe){
+            move(sc,Math.max(0,sc.scrollTop-Math.max(60,sc.clientHeight*0.6)));
+            await pause(350);if(stopped)break;
+            if(sc.isConnected){
+              bottomProbes++;
+              // 多次触底仍无新条目时，回到顶部重新逐屏核查；已完成的链接靠 seen 跳过。
+              // 这样可补捉列表重排或延迟插入的链接，而不是永远只盯着底部。
+              move(sc,bottomProbes%4===0?0:sc.scrollHeight);
+            }
+            probeDelay=Math.min(RETRY_MAX,probeDelay+RETRY_MIN);nextProbe=Date.now()+probeDelay;
+          }
+        }
+        await pause(900);
+      }catch(error){
+        // 识别失败、账号异常或数据库故障时等待修复，不冒充“扫描完成”。
+        phase='等待恢复';update(String(error.message||error)+'\n任务仍保持等待，可手动停止并下载。');await pause(RETRY_MIN);
+      }
+    }
+  }
+
+  // 每次导出都是点击当时的快照，不清空记录，不重置扫描状态，不按篇自动下载。
+  function allRows(){
+    const map=new Map();
+    for(const r of [...imports.values(),...records.values()]){
+      if(!validRecord(r))continue;const key=(r.platform||platform)+'\n'+(r.accountLabel||profile)+'\n'+r.url;
+      const old=map.get(key);if(!old||textSize(r)>=textSize(old))map.set(key,r);
+    }
+    return [...map.values()];
+  }
+  // 文件链接在当前页面保留，浏览器拦截下载时可再次点击；网页无法确认磁盘写入是否成功。
+  const generatedFiles=[];
+  function offerFile(blob,label){
+    const url=URL.createObjectURL(blob),link=add('a',undefined,files);
+    const name='AI-Chat-Backup-v'+VERSION+'-'+platform+'-'+label+'-'+Date.now()+'.md';
+    link.href=url;link.download=name;link.textContent=name+'（'+Math.ceil(blob.size/1024)+' KB，点击下载）';link.style.cssText='display:block;margin-top:8px;overflow-wrap:anywhere';
+    generatedFiles.push({url,link});
+    while(generatedFiles.length>10){const old=generatedFiles.shift();URL.revokeObjectURL(old.url);old.link.remove();}
+    try{link.click();}catch{/* 若浏览器不允许自动下载，上面的文件链接仍可点击。 */}
+    return name;
+  }
+  const inline=text=>String(text||'未命名对话').replace(/[\r\n]+/g,' ').replace(/[\\`*_{}\[\]<>#]/g,'\\$&');
+  // Blob 接收分段文本，减少合成单个巨型字符串的内存开销；一个按钮只生成一个文件。
+  // 每篇的原链接与对应正文放在同一节；未读链接也独立成节并明确标注状态。
+  function buildMarkdown(label){
+    const rows=allRows(),items=[...found.values()],chunks=[];
+    const audit=auditLinks(rows);
+    chunks.push('# AI 聊天记录备份\n\n脚本版本：v'+VERSION+'\n\n导出时间：'+new Date().toISOString()+'\n\n类型：'+label+'\n\n已保留链接：'+items.length+'；有正文的对话：'+rows.length+'。\n\n说明：仅网页已读取内容，完整性待核对；附件原文件不包含在本文件中。');
+    chunks.push('\n\n'+auditSummary(audit)+'\n\n核对说明：有正文表示已保存非空消息；读取结束不等于已证明服务器端全文完整。');
+    if(!items.length&&!rows.length)chunks.push('\n\n尚未发现聊天链接。');
+    for(const r of rows){
+      chunks.push('\n\n---\n\n# '+inline(r.title)+'\n\n平台：'+(r.platform||platform)+'\n\n原聊天链接：<'+r.url+'>\n\n读取状态：'+(r.loadFinished?'本轮读取结束，完整性待核对':'部分正文，尚未读完')+'\n\n读取时间：'+(r.capturedAt||'未知')+'\n\n本次读取用时：'+(Number.isFinite(r.elapsedSeconds)?r.elapsedSeconds+' 秒（含等待及重试）':'旧记录未计时')+'\n\n已读取消息数：'+r.messages.filter(hasText).length+'\n\n已复核轮数：'+(r.verificationRounds||'旧记录未记录'));
+      const info=bodyInfo(r);chunks.push('\n\n正文核对：'+info.messages+' 条非空消息（提问 '+info.users+' 条、回答 '+info.answers+' 条），'+info.characters+' 个文本字符。'+(!info.answers?'本篇尚未保存到 AI 回答，请核对原对话。':''));
+      for(const m of r.messages)if(hasText(m))chunks.push('\n\n## '+(m.role==='user'?'我':m.role==='assistant'?'AI':inline(m.role))+'\n\n',m.markdown?.trim()?m.markdown:m.text);
+      // 只有旧轮次包含本轮没有的消息文本时才附上，避免旧内容因新一轮读到一半而消失。
+      const covered=new Set(r.messages.filter(hasText).map(m=>JSON.stringify([m.role,m.markdown||m.text])));
+      for(const p of [...(r.previousPasses||[])].reverse()){
+        const extra=p.messages?.filter(hasText).some(m=>!covered.has(JSON.stringify([m.role,m.markdown||m.text])));
+        if(!extra)continue;
+        chunks.push('\n\n### 保留的旧读取版本\n\n此版本含当前读取尚未覆盖的内容，单独保留；与上文可能重复。\n\n读取时间：'+(p.capturedAt||'未知'));
+        for(const m of p.messages.filter(hasText)){chunks.push('\n\n#### '+(m.role==='user'?'我':'AI')+'\n\n',m.markdown||m.text);covered.add(JSON.stringify([m.role,m.markdown||m.text]));}
+      }
+    }
+    const unread=audit.entries.filter(x=>x.status==='missing');
+    for(const x of unread){chunks.push('\n\n---\n\n# '+inline(x.title)+'\n\n原聊天链接：<'+x.url+'>\n\n读取状态：仅保存链接，尚未读到正文。正文核对：未通过，缺失正文。'+(failures.has(x.url)?'\n\n当前问题：'+inline(failures.get(x.url).error):''));}
+    return new Blob(chunks,{type:'text/markdown;charset=utf-8'});
+  }
+  function exportMarkdown(final=false){
+    const blob=buildMarkdown(final?'手动停止后的汇总':'阶段性快照');
+    const name=offerFile(blob,final?'stopped-all':'progress-all');
+    update(auditSummary(auditLinks())+'\n已生成 '+name+'。若未自动下载，请点击下方文件链接。'+(running&&!stopped?'扫描继续运行。':''));
+    return blob;
+  }
+  async function runSession(){
+    try{await scan();}
+    finally{
+      // 等待当前篇的 finally 保存完毕，再生成最终文件，避免停止瞬间丢掉正在读取的正文。
+      await pendingSave;
+      discovery='用户手动停止；全量历史完整性未核验';
+      try{await persist();}catch(error){notice='本地保存失败，当前页面仍保留内容：'+error.message;}
+      if(elapsedTimer!==null){clearInterval(elapsedTimer);elapsedTimer=null;}
+      if(!stopped)frozenElapsed=Date.now();running=false;updateElapsed();phase='已停止';update();
+      if(!disposing){try{exportMarkdown(true);}catch(error){update('汇总文件生成失败：'+error.message+'。请保留页面，再点下载阶段性 Markdown 重试。');}}
+    }
+  }
+  startButton.onclick=()=>{
+    if(running)return;
+    // 在真实按钮点击里打开一个读取窗口；主页面专门负责历史列表。
+    // 点击时先打开同源首页以取得读取窗口；具体聊天必须检查本地后才打开。
+    const accountPrefix=platform==='gemini'?(location.pathname.match(/^\/u\/\d+/)?.[0]||''):'';
+    const initial=ORIGIN+(platform==='gemini'?accountPrefix+'/app':'/');
+    try{reader=window.open(initial,'ai_backup_reader_v38_'+platform,'width=1100,height=850');}
+    catch(error){update('读取窗口打开失败：'+error.message);return;}
+    if(!reader||reader.closed){update('读取窗口被拦截，请允许本网站弹窗后再点开始扫描。');return;}
+    stopped=false;running=true;sessionLinks=0;sessionBodies=0;sessionSkipped=0;phase='开始扫描';
+    linkStartedAt=null;linkTimingActive=false;frozenElapsed=0;updateElapsed();
+    if(elapsedTimer!==null)clearInterval(elapsedTimer);elapsedTimer=setInterval(updateElapsed,1000);
+    update('从最新聊天开始，逐篇检查本地后决定跳过或读取。');
+    task=runSession();task.catch(error=>{frozenElapsed=Date.now();running=false;if(elapsedTimer!==null){clearInterval(elapsedTimer);elapsedTimer=null;}updateElapsed();phase='运行异常';update(String(error.message||error));});
+  };
+  // 停止只设置信号：正文循环退出并保存后，由 runSession 统一生成最终文件一次。
+  stopButton.onclick=()=>{if(!running||stopped)return;frozenElapsed=Date.now();stopped=true;updateElapsed();phase='正在停止';update('正在保存当前篇已读内容，随后生成一个大的 Markdown。');};
+  // 阶段性下载不改 stopped、不调用扫描函数，也不清空数据库。
+  downloadButton.onclick=()=>{try{exportMarkdown(false);}catch(error){update('文件生成失败：'+error.message+'。已读取的内容仍保留在当前页面。');}};
+  window[CONTROL]={
+    async dispose(){disposing=true;frozenElapsed=Date.now();stopped=true;if(elapsedTimer!==null){clearInterval(elapsedTimer);elapsedTimer=null;}if(task)await task.catch(()=>{});await pendingSave;db.close();for(const f of generatedFiles)URL.revokeObjectURL(f.url);panel.remove();delete window[CONTROL];}
+  };
+  update('已恢复同一账号标签下的进度。点“开始扫描”逐篇读取；运行期间可随时下载阶段性 Markdown。');
+})().catch(error=>{console.error('[AI 聊天备份 v3.8]',error);alert('AI 聊天备份 v3.8：'+error.message);});
