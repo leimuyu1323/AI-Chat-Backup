@@ -1,0 +1,79 @@
+/**
+ * CourseWorks calendar -> Google Tasks, one-way, hourly.
+ * Completed tasks stay completed. No source events or tasks are deleted.
+ * @OnlyCurrentDoc
+ */
+const SOURCE_CALENDAR = 'o54okllpm5npkmouorvt95qf89h51iv6@import.calendar.google.com';
+const LIST_TITLE = 'My Tasks';
+const LOCAL_ZONE = 'America/New_York';
+
+function setupCourseWorksSync() {
+  syncCourseWorks();
+  if (!ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'syncCourseWorks')) {
+    ScriptApp.newTrigger('syncCourseWorks').timeBased().everyHours(1).create();
+  }
+  console.log('Hourly sync enabled.');
+}
+
+function syncCourseWorks() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return;
+  try {
+    const calendar = CalendarApp.getCalendarById(SOURCE_CALENDAR);
+    if (!calendar) throw new Error('CourseWorks calendar not found.');
+    let lists = [], token;
+    do {
+      const page = Tasks.Tasklists.list({maxResults:100, pageToken:token});
+      lists = lists.concat(page.items || []);
+      token = page.nextPageToken;
+    } while (token);
+    const list = lists.find(x => x.title === LIST_TITLE) ||
+      Tasks.Tasklists.insert({title:LIST_TITLE});
+    const existing = new Map();
+    token = undefined;
+    do {
+      const page = Tasks.Tasks.list(list.id, {
+        maxResults:100, showCompleted:true, showHidden:true,
+        showDeleted:false, pageToken:token
+      });
+      (page.items || []).forEach(t => {
+        const match = (t.notes || '').match(/CourseWorks-ID: (.+)/);
+        if (match) existing.set(match[1], t);
+      });
+      token = page.nextPageToken;
+    } while (token);
+    const now = new Date();
+    const start = new Date(now.getTime() - 14*86400000);
+    const end = new Date(now.getTime() + 365*86400000);
+    let created = 0, updated = 0;
+    calendar.getEvents(start, end).forEach(event => {
+      const date = event.getStartTime();
+      const id = event.getId() + (event.isRecurringEvent() ? ':' + date.toISOString() : '');
+      const day = Utilities.formatDate(date, LOCAL_ZONE, 'yyyy-MM-dd');
+      const time = event.isAllDayEvent() ? '全天' :
+        Utilities.formatDate(date, LOCAL_ZONE, 'yyyy-MM-dd HH:mm z');
+      const description = event.getDescription() || '';
+      const plain = description;
+      const notes = ('来源：CourseWorks / Canvas\n时间：' + time +
+        '\n地点：' + (event.getLocation() || '未注明') +
+        '\n\n' + plain).slice(0, 7000) + '\n\nCourseWorks-ID: ' + id;
+      const body = {title:event.getTitle().slice(0,1024), notes:notes,
+        due:day + 'T00:00:00.000Z'};
+      const task = existing.get(id);
+      if (!task) {
+        // First run skips past deadlines; known tasks still receive date updates.
+        if (date < now) return;
+        const inserted = Tasks.Tasks.insert(body, list.id);
+        existing.set(id, inserted);
+        created++;
+      } else if (task.title !== body.title || task.notes !== body.notes ||
+          (task.due || '').slice(0,10) !== day) {
+        Tasks.Tasks.patch(body, list.id, task.id);
+        updated++;
+      }
+    });
+    console.log('Created ' + created + ', updated ' + updated + '. Completed status preserved.');
+  } finally {
+    lock.releaseLock();
+  }
+}
